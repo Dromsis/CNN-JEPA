@@ -1,0 +1,68 @@
+seed: 42
+
+name: "I-JEPA-YOLO_{data_dataset_name}_{backbone_name}{backbone_scale}_predL{predictor_n_layers}K{predictor_kernel_size}_Mask{mask_strategy}_lr{optimizer_lr}_wd{optimizer_weight_decay}_bs{optimizer_batch_size}"
+artifacts_root: "artifacts/pretrain_lightly/ijepacnn_yolo"
+
+mask:
+  strategy: "mixed" # multi-block | random | mixed
+  mutli_block_kwargs:
+    aspect_ratio: [0.75, 1.5]
+    enc_mask_scale: [1.0, 1.0]
+    min_keep: 5
+    num_enc_blocks: 1
+    num_pred_blocks: 4
+    pred_mask_scale: [0.15, 0.2]
+  mixed_mutli_block_ratio: 0.75
+
+# NOTE: "lots of water" dataset. Start with this default and MEASURE first; only tune the
+# mask (lower ratio, or variance-biased sampling) if the pretrained features are weak.
+mask_ratio: 0.6
+
+backbone:
+  name: "yolo26_sea_backbone"
+  scale: "n" # n | s
+  pretrained_weights: null
+  kwargs:
+    # Path to the yolo26-sea.yaml in the yolo_sea_homemade repo:
+    yaml_path: "/home/enzobel/Documents/yolo_sea_homemade/ultralytics/cfg/models/26/yolo26-sea.yaml"
+    scale: "n"
+    # Repo root so the vendored `ultralytics` package is importable (or set YOLO_SEA_REPO env):
+    yolo_repo_path: "/home/enzobel/Documents/yolo_sea_homemade"
+    in_chans: 3
+
+predictor:
+  n_layers: 3
+  kernel_size: 3
+  dw_sep_conv: True
+use_projection_head: False
+
+data:
+  # NOTE: requires a "maritime" entry in trainer_common.setup() (ImageFolder of the unlabeled
+  # 65k+300k images, input_size=640) AND guarding the online linear classifier (no labels).
+  # See NOTES_YOLO_JEPA.md.
+  dataset_name: "maritime"
+  num_workers: 12
+
+trainer:
+  max_epochs: 201
+  devices: "auto"
+  accelerator: "gpu"
+  precision: "bf16"
+  accumulate_grad_batches: null
+  overfit_batches: 0.0
+
+optimizer:
+  batch_size: 16
+  lr: 0.01
+  weight_decay: 0.01
+  cosine_warmpup_sched: True
+  lr_warmup_epochs: 10
+  exclude_norm_and_bias_from_wd: False
+  wd_schedule: False
+
+wandb: true
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
