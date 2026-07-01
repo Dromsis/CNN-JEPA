@@ -10,7 +10,19 @@ import time
 from typing import Callable
 from omegaconf import DictConfig, OmegaConf
 import pytorch_lightning as pl
-from lightning_lite.utilities.rank_zero import _get_rank
+try:
+    # pytorch-lightning >= 1.9 renamed lightning_lite -> lightning_fabric
+    from lightning_fabric.utilities.rank_zero import _get_rank
+except Exception:
+    try:
+        from lightning_lite.utilities.rank_zero import _get_rank  # pl 1.8
+    except Exception:
+        # Last resort: derive rank from the launcher env (single-GPU -> 0).
+        def _get_rank():
+            for k in ("RANK", "LOCAL_RANK", "SLURM_PROCID"):
+                if k in os.environ:
+                    return int(os.environ[k])
+            return 0
 import torch
 import torchvision
 import torch.nn as nn
@@ -29,8 +41,8 @@ from pretrain.online_classification_benchmark import OnlineLinearClassificationB
 import utils
 
 from data.imagenette import Imagenette
-from data.cached_imagenet import CachedImageNet
 from data.hdf5_imagefolder import HDF5ImageFolder
+from data.flat_image_folder import FlatImageFolder
 
 class LightlyModel(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
@@ -98,6 +110,11 @@ class LightlyModel(pl.LightningModule):
         return batch[0]
 
     def on_validation_epoch_end(self) -> None:
+        # The online linear-probe benchmark needs labels and scans the whole train+val set to
+        # fit a classifier every few epochs. With unlabeled data it is meaningless AND very
+        # slow, so it can be turned off with data.online_benchmark=false.
+        if not self.cfg.data.get("online_benchmark", True):
+            return
         if not self.trainer.sanity_checking:
             if self.current_epoch % 5 == 0:
                 try:
@@ -181,6 +198,7 @@ class LightlyModel(pl.LightningModule):
             "imagenette": Imagenette,
             "imagenet-100": HDF5ImageFolder, # Replaceable with torchvision.datasets.ImageFolder
             "imagenet-1k":  HDF5ImageFolder, # Replaceable with torchvision.datasets.ImageFolder
+            "maritime": FlatImageFolder, # flat, label-free dir of images (combined/images/<split>)
         }
         train_dataset_kwargs = {
             "cifar10": dict(root="/data/cifar10", download=True),
@@ -189,6 +207,8 @@ class LightlyModel(pl.LightningModule):
             "imagenette": dict(root="/data/imagenette", split='train', download=True),
             "imagenet-100": dict(root="/data/imagenet-100-train.h5"),
             "imagenet-1k": dict(root="/data/imagenet-train.h5"),
+            # All images under combined/images/train (flat, ~121k). YOLO labels ignored.
+            "maritime": dict(root="/data/combined/images/train"),
         }
         val_dataset_kwargs = {
             "cifar10": dict(root="/data/cifar10", train=False),
@@ -197,6 +217,8 @@ class LightlyModel(pl.LightningModule):
             "imagenette": dict(root="/data/imagenette", split='val'),
             "imagenet-100": dict(root="/data/imagenet-100-val.h5"),
             "imagenet-1k": dict(root="/data/imagenet-val.h5"),
+            # val split, only used for the JEPA val loss.
+            "maritime": dict(root="/data/combined/images/val"),
         }
         input_sizes = {
             "cifar10": 32,
@@ -205,6 +227,7 @@ class LightlyModel(pl.LightningModule):
             "imagenette": 224,
             "imagenet-100": 224,
             "imagenet-1k": 224,
+            "maritime": 640,
         }
         num_classes = {
             "cifar10": 10,
@@ -213,6 +236,7 @@ class LightlyModel(pl.LightningModule):
             "imagenette": 10,
             "imagenet-100": 100,
             "imagenet-1k": 1000,
+            "maritime": 1, # dummy; data is unlabeled (FlatImageFolder returns label 0)
         }
         self.dataset_class = dataset_classes[self.cfg.data.dataset_name]
         self.train_dataset_kwargs = train_dataset_kwargs[self.cfg.data.dataset_name]
@@ -247,6 +271,16 @@ class LightlyModel(pl.LightningModule):
             dist_rank=self.trainer.global_rank if self._trainer is not None else 0,
         ) # WARNING: At this point device is CPU!!!
 
+    def _loader_perf_kwargs(self):
+        # pin_memory speeds host->GPU copies; persistent_workers/prefetch_factor only make
+        # sense (and are only allowed) when there are worker processes.
+        kwargs = dict(pin_memory=True)
+        if self.cfg.data.num_workers > 0:
+            # prefetch_factor=2 (the default): higher values × many workers × large batch hold
+            # thousands of 640px tensors in RAM and OOM-kill the process on a 70 GB box.
+            kwargs.update(persistent_workers=True, prefetch_factor=2)
+        return kwargs
+
     def train_dataloader(self):
         dataloader = torch.utils.data.DataLoader(
             self.train_dataset,
@@ -254,6 +288,7 @@ class LightlyModel(pl.LightningModule):
             shuffle=True,
             drop_last=True,
             num_workers=self.cfg.data.num_workers,
+            **self._loader_perf_kwargs(),
         )
         return dataloader
 
@@ -264,6 +299,7 @@ class LightlyModel(pl.LightningModule):
             shuffle=False,
             drop_last=False,
             num_workers=self.cfg.data.num_workers,
+            **self._loader_perf_kwargs(),
         )
         return dataloader
 
@@ -291,6 +327,9 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
     print("Running on:", os.environ.get("HOSTNAME", "docker"), flush=True)
     os.system("nvidia-smi")
     print(torch.cuda.device_count(), "GPUs available", flush=True)
+
+    # Use TF32 matmuls on Tensor Cores (Ampere/Ada) for faster fp32 ops.
+    torch.set_float32_matmul_precision("high")
 
     # hydra doesn't allow us to add new keys for "safety"
     # set_struct(..., False) disables this behavior and allows us to add more parameters

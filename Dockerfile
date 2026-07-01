@@ -1,64 +1,37 @@
-FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+# Image for Ada-Lovelace GPUs (L40S, RTX 40xx, sm_89).
+#
+# Why this combo:
+#   - torch 2.0.1 is the highest torch that pairs cleanly with pytorch-lightning 1.9.x, which
+#     this codebase still depends on API-wise (val_dataloaders[0], precision="bf16", ...).
+#   - torch 2.0.1 ships prebuilt ONLY as cu11.7 on Docker Hub, and cu11.7 has no sm_89 path.
+#     So instead of a pytorch/* base we start from a cu11.8 CUDA base and pip-install the
+#     torch 2.0.1 + cu11.8 wheel: its sm_80/sm_86 cubins are forward-compatible to sm_89,
+#     so it runs on the L40S.
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
-# Fix error: The repository 'https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64  InRelease' is not signed.
-# Based on: https://github.com/NVIDIA/nvidia-docker/issues/1631#issuecomment-1112682423
-# NVIDIA solution: https://forums.developer.nvidia.com/t/notice-cuda-linux-repository-key-rotation/212772
-RUN rm /etc/apt/sources.list.d/cuda.list
-RUN rm /etc/apt/sources.list.d/nvidia-ml.list
-RUN apt-key del 7fa2af80
-RUN apt-get update && apt-get install -y --no-install-recommends wget
-RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/cuda-keyring_1.0-1_all.deb
-RUN dpkg -i cuda-keyring_1.0-1_all.deb
-
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_NO_CACHE_DIR=1
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    tmux \
-    nano \
-    htop \
-    wget \
-    curl \
-    git \
-    libsm6 \        
-    libxrender1 \  
-    libfontconfig1 \ 
-    ffmpeg \
-    libxext6 \
-    openssh-server \
-    cmake \
-    libncurses5-dev \
-    libncursesw5-dev \
-    build-essential
+    python3.10 python3.10-dev python3-pip \
+    git curl wget build-essential cmake \
+    libsm6 libxrender1 libfontconfig1 libxext6 libgl1 ffmpeg \
+    tmux nano htop \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python3
 
-RUN echo 'PermitRootLogin yes\nSubsystem sftp internal-sftp\nX11Forwarding yes\nX11UseLocalhost no\nAllowTcpForwarding yes' > /etc/ssh/sshd_config
-EXPOSE 22
-RUN groupadd sshgroup
-RUN mkdir /var/run/sshd
-RUN mkdir -p /root/.ssh && \
-    chmod 0700 /root/.ssh
+RUN python -m pip install --upgrade pip
 
-# ADD YOUR PUBLIC KEY HERE 
-# COPY cm-docker.pub /root/.ssh
-# RUN cat /root/.ssh/cm-docker.pub >> /root/.ssh/authorized_keys
-RUN echo 'PATH=$PATH:/opt/conda/bin' >> ~/.bashrc # somehow conda is missing from PATH if login via ssh
+# rclone: syncs the dataset from the Cloudflare R2 bucket (sea-vis-data-fan).
+RUN curl https://rclone.org/install.sh | bash || true
 
-# REPLACE 655Q6b3&k*9! WITH YOUR PASSWORD
-RUN echo 'root:655Q6b3&k*9!' | chpasswd
+# torch 2.0.1 + cu11.8 (runs on L40S sm_89 via sm_80/sm_86 cubin forward-compat).
+RUN pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
 
-# Force bash color prompt
-RUN sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/g' ~/.bashrc
+# Everything on top of torch (lightning 1.9.5, lightly, timm, ...). numpy is pinned <2 there.
+COPY requirements-l40s.txt /workspace/requirements-l40s.txt
+RUN pip install -r /workspace/requirements-l40s.txt
 
-RUN git clone https://github.com/Syllo/nvtop.git -b 3.0.1 ~/nvtop
-RUN mkdir -p ~/nvtop/build
-RUN cd ~/nvtop/build && cmake .. -DNVIDIA_SUPPORT=ON -DAMDGPU_SUPPORT=OFF -DINTEL_SUPPORT=OFF
-RUN cd ~/nvtop/build && make
-RUN cd ~/nvtop/build && make install
-
-RUN ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh && \
-    echo ". /opt/conda/etc/profile.d/conda.sh \n" >> ~/.bashrc && \
-    echo "conda activate base" >> ~/.bashrc
-SHELL ["conda", "run", "-n", "base", "/bin/bash", "-c"]
-
-COPY requirements.txt /workspace
-RUN ["conda", "run", "-n", "base", "pip", "install", "-r", "/workspace/requirements.txt"]
-
+WORKDIR /workspace
 CMD ["/bin/bash"]
