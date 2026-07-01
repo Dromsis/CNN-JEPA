@@ -67,23 +67,35 @@ class IJEPA_YOLO(IJEPA_CNN):
             self.projection_head = None
             self.projection_head_momentum = None
 
-        pred_layers = []
+        # Final-level predictor (encoder output / layer-11 dim).
+        self.predictor = self._build_predictor(c, norm_cls)
+
+        # Deep Self-Supervision (V-JEPA 2.1): also supervise the TRUNK output (layer-8) level so
+        # local information is pushed toward the final layers. Aux predictor at trunk_channels;
+        # its target is the EMA encoder's trunk output. Off unless cfg enables it.
+        self.deep_supervision = bool(self.cfg.get("deep_supervision", {}).get("enabled", False)) \
+            if self.cfg.get("deep_supervision", None) is not None else False
+        if self.deep_supervision:
+            self.predictor_trunk = self._build_predictor(self.backbone.trunk_channels, norm_cls)
+
+        self.criterion = F.smooth_l1_loss
+
+    def _build_predictor(self, c, norm_cls):
+        layers = []
         n_layers = self.cfg.predictor.n_layers
         for i in range(n_layers):
             if self.cfg.predictor.get("dw_sep_conv", False):
-                pred_layers.append(nn.Conv2d(c, c, self.cfg.predictor.kernel_size, padding="same", groups=c))
-                pred_layers.append(nn.Conv2d(c, c, kernel_size=1, padding="same"))
+                layers.append(nn.Conv2d(c, c, self.cfg.predictor.kernel_size, padding="same", groups=c))
+                layers.append(nn.Conv2d(c, c, kernel_size=1, padding="same"))
             else:
-                pred_layers.append(nn.Conv2d(c, c, self.cfg.predictor.kernel_size, padding="same"))
+                layers.append(nn.Conv2d(c, c, self.cfg.predictor.kernel_size, padding="same"))
             # No norm/ReLU on the LAST layer: the predictor must output raw (possibly negative)
             # features to match the target encoder's embeddings. A final ReLU would clamp the
             # prediction to >=0 and cripple the JEPA loss.
             if i < n_layers - 1:
-                pred_layers.append(norm_cls(c))
-                pred_layers.append(nn.ReLU(inplace=True))
-        self.predictor = nn.Sequential(*pred_layers)
-
-        self.criterion = F.smooth_l1_loss
+                layers.append(norm_cls(c))
+                layers.append(nn.ReLU(inplace=True))
+        return nn.Sequential(*layers)
 
     def forward(self, x):
         inp_bchw = x
@@ -113,14 +125,47 @@ class IJEPA_YOLO(IJEPA_CNN):
 
         # step 5. Predict masked-region embeddings.
         z = self.predictor(feat)
+
+        if self.deep_supervision:
+            # Aux prediction at the trunk (layer-8) level, from the densified trunk features.
+            z_trunk = self.predictor_trunk(trunk_dense)
+            return {"trunk": z_trunk, "final": z}, context_mask_b1ff, target_mask_b1ff
         return z, context_mask_b1ff, target_mask_b1ff
 
     def forward_momentum(self, x):
-        # EMA target encoder = full DENSE backbone (trunk + tail) on the unmasked image.
+        # EMA target encoder = full DENSE backbone on the unmasked image.
+        if self.deep_supervision:
+            trunk_out = self.backbone_momentum.forward_trunk(x)
+            final = self.backbone_momentum.forward_tail(trunk_out)
+            if self.projection_head_momentum is not None:
+                final = self.projection_head_momentum(final)
+            return {"trunk": trunk_out.detach(), "final": final.detach()}
         z = self.backbone_momentum(x)
         if self.projection_head_momentum is not None:
             z = self.projection_head_momentum(z)
         return z.detach()
+
+    def train_val_step(self, batch, batch_idx, metric_label="train_metrics"):
+        # Single-level path (incl. the V-JEPA 2.1 context loss) is handled by the parent.
+        if not self.deep_supervision:
+            return super().train_val_step(batch, batch_idx, metric_label)
+
+        # Deep Self-Supervision: sum the JEPA loss (masked + context) over all levels.
+        x = batch[0]
+        p_levels, context_mask_b1ff, target_mask_b1ff = self.forward(x)
+        h_levels = self.forward_momentum(x)
+        lam = self._lambda_eff()
+        total = 0.0
+        for name in p_levels:
+            loss_pred, loss_ctx = self._jepa_level_loss(
+                p_levels[name], h_levels[name], context_mask_b1ff, target_mask_b1ff)
+            level_loss = loss_pred + (lam * loss_ctx if loss_ctx is not None else 0.0)
+            total = total + level_loss
+            self.log(f"{metric_label}/ijepa_loss_{name}", loss_pred, on_epoch=True)
+            if loss_ctx is not None:
+                self.log(f"{metric_label}/ctx_loss_{name}", loss_ctx, on_epoch=True)
+        self.log(f"{metric_label}/loss", total, on_epoch=True)
+        return total
 
 
 @hydra.main(version_base="1.2", config_path="configs/", config_name="ijepacnn_yolo_maritime.yaml")

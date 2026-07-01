@@ -199,18 +199,66 @@ class IJEPA_CNN(LightlyModelMomentum):
             z = self.projection_head_momentum(z)
         return z.detach()
 
-    def train_val_step(self, batch, batch_idx, metric_label="train_metrics"):
-        x = batch[0]
-        p, _, target_mask_b1ff = self.forward(x)
-        h = self.forward_momentum(x)
-        # Normalize in feature dimension separately for each patch
+    @staticmethod
+    @torch.no_grad()
+    def _context_distance_weight(target_mask_b1ff):
+        """V-JEPA 2.1 eq.3 weighting: w_i = 1/sqrt(d_min(i, masked)).
+
+        d_min is the Chebyshev distance (in grid cells) from each cell to the nearest masked
+        cell, computed with iterative 3x3 max-pool dilations (cheap on a ~20x20 grid). Masked
+        cells get d=0 (they are excluded downstream by the context mask).
+        """
+        m = target_mask_b1ff.to(torch.float32)
+        f = m.shape[-1]
+        dist = torch.zeros_like(m)
+        covered = m.clone()
+        cur = m
+        for d in range(1, f + 1):
+            cur = F.max_pool2d(cur, kernel_size=3, stride=1, padding=1)
+            newly = (cur > 0) & (covered == 0)
+            dist = dist + d * newly.to(dist.dtype)
+            covered = covered + newly.to(covered.dtype)
+        dist = torch.where(covered > 0, dist, torch.full_like(dist, float(f)))
+        return 1.0 / torch.sqrt(dist.clamp(min=1.0))
+
+    def _lambda_eff(self):
+        """Effective context-loss weight with progressive warmup (0 if disabled)."""
+        cl = self.cfg.get("context_loss", None)
+        if cl is None or not cl.get("enabled", False):
+            return 0.0
+        lam = float(cl.get("lambda", 0.5))
+        warm = int(cl.get("warmup_epochs", 0))
+        return lam * min(1.0, (self.current_epoch + 1) / warm) if warm > 0 else lam
+
+    def _jepa_level_loss(self, p, h, context_mask_b1ff, target_mask_b1ff):
+        """JEPA loss for one prediction level. Returns (masked_loss, context_loss_or_None)."""
         p = F.normalize(p, dim=1)
         h = F.normalize(h, dim=1)
-        loss = F.smooth_l1_loss(p, h, reduction='none').sum(axis=1,keepdim=True) # (B, 1, H, W)
-        # loss = F.cosine_similarity(p, h, dim=1).unsqueeze(1)  # (B, 1, H, W)
-        neg_mask_b1ff = target_mask_b1ff
-        loss = loss.mul_(neg_mask_b1ff).sum() / (neg_mask_b1ff.sum() + 1e-8)  # loss only on masked patches
-        self.log(f"{metric_label}/ijepa_loss", loss, on_epoch=True)
+        per_pos = F.smooth_l1_loss(p, h, reduction='none').sum(axis=1, keepdim=True)  # (B,1,f,f)
+        tgt = target_mask_b1ff.to(per_pos.dtype)
+        loss_pred = per_pos.mul(tgt).sum() / (tgt.sum() + 1e-8)  # masked patches (original JEPA)
+        loss_ctx = None
+        cl = self.cfg.get("context_loss", None)
+        if cl is not None and cl.get("enabled", False):
+            # V-JEPA 2.1: also supervise VISIBLE patches (weighted by 1/sqrt(dist to mask)) so
+            # they encode local structure instead of becoming global aggregators.
+            w = self._context_distance_weight(target_mask_b1ff)
+            ctx = context_mask_b1ff.to(per_pos.dtype) * w
+            loss_ctx = per_pos.mul(ctx).sum() / (ctx.sum() + 1e-8)
+        return loss_pred, loss_ctx
+
+    def train_val_step(self, batch, batch_idx, metric_label="train_metrics"):
+        x = batch[0]
+        p, context_mask_b1ff, target_mask_b1ff = self.forward(x)
+        h = self.forward_momentum(x)
+        loss_pred, loss_ctx = self._jepa_level_loss(p, h, context_mask_b1ff, target_mask_b1ff)
+        loss = loss_pred
+        self.log(f"{metric_label}/ijepa_loss", loss_pred, on_epoch=True)
+        if loss_ctx is not None:
+            lam = self._lambda_eff()
+            loss = loss_pred + lam * loss_ctx
+            self.log(f"{metric_label}/ctx_loss", loss_ctx, on_epoch=True)
+            self.log(f"{metric_label}/ctx_lambda", lam, on_epoch=True)
         return loss
     
     # def configure_optimizers(self):

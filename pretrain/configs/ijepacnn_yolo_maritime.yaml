@@ -36,6 +36,20 @@ predictor:
   dw_sep_conv: True
 use_projection_head: False
 
+# V-JEPA 2.1 dense/context loss: supervise the visible patches too (weighted by 1/sqrt(dist to
+# the masked region), with a lambda warmup) so features stay spatially structured -> better for
+# a DENSE downstream task like detection. See arXiv:2603.14482.
+context_loss:
+  enabled: true
+  lambda: 0.5          # paper's best fixed weight; total loss = L_masked + lambda_eff * L_context
+  warmup_epochs: 30    # ramp lambda 0 -> lambda over the first N epochs (paper warms ~50-100)
+
+# V-JEPA 2.1 Deep Self-Supervision: also apply the JEPA loss at the trunk (layer-8) level, not
+# only at the final output, so local structure flows toward the deeper layers. Adds an aux
+# predictor whose target is the EMA encoder's trunk output. See arXiv:2603.14482 sec 2.3.2.
+deep_supervision:
+  enabled: true
+
 data:
   # Unlabeled pretraining on /data/combined/images/train (flat dir, ~121k images, 640px).
   dataset_name: "maritime"
