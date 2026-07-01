@@ -10,12 +10,15 @@
 # map. We therefore densify right after the trunk and let the tail run normally. Masking,
 # EMA target encoder, loss and the whole training loop are inherited unchanged.
 
+import copy
+
 import hydra
 from omegaconf import DictConfig
 import torch
 from torch import nn
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
+from lightly.models.utils import deactivate_requires_grad
 
 from pretrain.trainer_common import LightlyModelMomentum, main_pretrain
 from pretrain.train_ijepacnn import IJEPA_CNN
@@ -45,18 +48,39 @@ class IJEPA_YOLO(IJEPA_CNN):
         trunc_normal_(self.mask_token, mean=0, std=0.02, a=-0.02, b=0.02)
 
         # Predictor operates at the encoder OUTPUT dim (tail / layer-11 = num_features).
-        self.projection_head = None
         norm_cls = nn.BatchNorm2d
         c = self.backbone.num_features
+
+        # Optional projection head (student) + its EMA copy (teacher). Off by default.
+        if self.cfg.get("use_projection_head", False):
+            proj_layers = []
+            proj_depth = self.cfg.get("projection_head_depth", 2)
+            for i in range(proj_depth):
+                proj_layers.append(nn.Conv2d(c, c, kernel_size=1, padding="same"))
+                if i < proj_depth - 1:
+                    proj_layers.append(norm_cls(c))
+                    proj_layers.append(nn.ReLU(inplace=True))
+            self.projection_head = nn.Sequential(*proj_layers)
+            self.projection_head_momentum = copy.deepcopy(self.projection_head)
+            deactivate_requires_grad(self.projection_head_momentum)
+        else:
+            self.projection_head = None
+            self.projection_head_momentum = None
+
         pred_layers = []
-        for _ in range(self.cfg.predictor.n_layers):
+        n_layers = self.cfg.predictor.n_layers
+        for i in range(n_layers):
             if self.cfg.predictor.get("dw_sep_conv", False):
                 pred_layers.append(nn.Conv2d(c, c, self.cfg.predictor.kernel_size, padding="same", groups=c))
                 pred_layers.append(nn.Conv2d(c, c, kernel_size=1, padding="same"))
             else:
                 pred_layers.append(nn.Conv2d(c, c, self.cfg.predictor.kernel_size, padding="same"))
-            pred_layers.append(norm_cls(c))
-            pred_layers.append(nn.ReLU(inplace=True))
+            # No norm/ReLU on the LAST layer: the predictor must output raw (possibly negative)
+            # features to match the target encoder's embeddings. A final ReLU would clamp the
+            # prediction to >=0 and cripple the JEPA loss.
+            if i < n_layers - 1:
+                pred_layers.append(norm_cls(c))
+                pred_layers.append(nn.ReLU(inplace=True))
         self.predictor = nn.Sequential(*pred_layers)
 
         self.criterion = F.smooth_l1_loss
@@ -83,6 +107,10 @@ class IJEPA_YOLO(IJEPA_CNN):
         # step 4. DENSE tail (SESA -> SPPF -> C2PSA). No leakage now: the map is fully filled.
         feat = self.backbone.forward_tail(trunk_dense)  # (B, num_features, f, f)
 
+        # step 4.5. Project (student projection head, if enabled).
+        if self.projection_head is not None:
+            feat = self.projection_head(feat)
+
         # step 5. Predict masked-region embeddings.
         z = self.predictor(feat)
         return z, context_mask_b1ff, target_mask_b1ff
@@ -90,6 +118,8 @@ class IJEPA_YOLO(IJEPA_CNN):
     def forward_momentum(self, x):
         # EMA target encoder = full DENSE backbone (trunk + tail) on the unmasked image.
         z = self.backbone_momentum(x)
+        if self.projection_head_momentum is not None:
+            z = self.projection_head_momentum(z)
         return z.detach()
 
 
