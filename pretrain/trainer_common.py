@@ -330,6 +330,9 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
 
     # Use TF32 matmuls on Tensor Cores (Ampere/Ada) for faster fp32 ops.
     torch.set_float32_matmul_precision("high")
+    # All pretrain configs use a fixed input size, so let cudnn benchmark conv algorithms
+    # once per shape and reuse the fastest one.
+    torch.backends.cudnn.benchmark = True
 
     # hydra doesn't allow us to add new keys for "safety"
     # set_struct(..., False) disables this behavior and allows us to add more parameters

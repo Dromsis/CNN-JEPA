@@ -65,8 +65,18 @@ trainer:
   accumulate_grad_batches: null
   overfit_batches: 0.0
 
+# Perf knobs (L40S). channels_last: NHWC layout for tensor-core convs. compile:
+# false | "dense" (teacher/tail/predictors only) | "all" (also the sparse student trunk).
+# First step pays a few minutes of compile warmup; set compile: false when debugging
+# stack traces. If TORCH_LOGS=recompiles shows churn on torch 2.0.x, use "dense".
+perf:
+  channels_last: true
+  compile: "all"
+
 optimizer:
-  batch_size: 16
+  # 64 fills ~1/3 of the L40S (48 GB) at 640px; per-step costs (mask sampling, EMA, launches)
+  # amortize over the batch, and bs 128 = the validated ImageNet recipe (same lr 0.01).
+  batch_size: 64
   lr: 0.01
   weight_decay: 0.01
   cosine_warmpup_sched: True

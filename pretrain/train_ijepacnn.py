@@ -105,6 +105,12 @@ class IJEPA_CNN(LightlyModelMomentum):
 
     def setup(self, stage: str) -> None:
         super().setup(stage)
+        self._setup_masking(self.input_size)
+
+    def _setup_masking(self, input_size: int) -> None:
+        """Derive the mask geometry from the input size. Factored out of setup() so tooling
+        (e.g. scripts/profile_step.py) can configure masking without the datasets."""
+        self.input_size = input_size
         if self.cfg.backbone.name.lower().startswith('resnet') or self.cfg.backbone.name.lower().startswith('wide_resnet'):
             self.downsample_raito = 32
         else:
@@ -230,8 +236,11 @@ class IJEPA_CNN(LightlyModelMomentum):
         warm = int(cl.get("warmup_epochs", 0))
         return lam * min(1.0, (self.current_epoch + 1) / warm) if warm > 0 else lam
 
-    def _jepa_level_loss(self, p, h, context_mask_b1ff, target_mask_b1ff):
-        """JEPA loss for one prediction level. Returns (masked_loss, context_loss_or_None)."""
+    def _jepa_level_loss(self, p, h, context_mask_b1ff, target_mask_b1ff, ctx_weight=None):
+        """JEPA loss for one prediction level. Returns (masked_loss, context_loss_or_None).
+
+        `ctx_weight` lets callers with several levels (deep supervision) compute the distance
+        weighting once and share it: it only depends on the masks, not on the level."""
         p = F.normalize(p, dim=1)
         h = F.normalize(h, dim=1)
         per_pos = F.smooth_l1_loss(p, h, reduction='none').sum(axis=1, keepdim=True)  # (B,1,f,f)
@@ -242,7 +251,7 @@ class IJEPA_CNN(LightlyModelMomentum):
         if cl is not None and cl.get("enabled", False):
             # V-JEPA 2.1: also supervise VISIBLE patches (weighted by 1/sqrt(dist to mask)) so
             # they encode local structure instead of becoming global aggregators.
-            w = self._context_distance_weight(target_mask_b1ff)
+            w = ctx_weight if ctx_weight is not None else self._context_distance_weight(target_mask_b1ff)
             ctx = context_mask_b1ff.to(per_pos.dtype) * w
             loss_ctx = per_pos.mul(ctx).sum() / (ctx.sum() + 1e-8)
         return loss_pred, loss_ctx

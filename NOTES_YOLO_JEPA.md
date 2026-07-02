@@ -71,6 +71,35 @@ matches inference (no mask at finetune time -> SESA always sees a dense map).
    `downsample_ratio` (32) -> a 20x20 mask grid (400 patches). Confirmed consistent once the
    maritime `input_size=640` entry exists.
 
+## Performance (L40S, 640px)
+
+Baseline measured: bs 64 @ ~3.0 it/s (~192 img/s, ~13 effective TFLOPS — GPU busy but
+launch/sync-bound, not compute-bound). Changes applied:
+
+- **Dense masked BatchNorm** (`models/sparse_encoder.sp_bn_forward_dense`): the SparK
+  gather->BN1d->scatter did a `nonzero()` (= forced GPU->CPU sync) at EVERY BN of every step.
+  Rewritten as dense masked mean/var — numerically identical (fwd, grads, running stats):
+  `PYTHONPATH=. python tests/test_sparse_bn_equivalence.py`. SyncBN (DDP) keeps the gather path.
+- **Per-step mask cache** (`sparse_encoder.set_active` + `_get_active_ex_or_ii`): the expanded
+  masks were recomputed for every conv/BN; now computed once per resolution per step.
+  `IJEPA_YOLO.forward` prefills all trunk resolutions so compiled regions never mutate the cache.
+- **`perf:` config block** (`ijepacnn_yolo_maritime.yaml`): `channels_last` (NHWC tensor-core
+  convs) and `compile` (false | "dense" = teacher/tail/predictors | "all" = + sparse trunk).
+  `torch._dynamo.config.suppress_errors=True` -> a compile failure falls back to eager instead
+  of killing the run. On torch 2.0.x, check `TORCH_LOGS=recompiles` once; if graphs churn, use
+  "dense". Compile warmup is a few minutes on the first step.
+- **Fused EMA** (`IJEPA_YOLO._ema_update`): `torch._foreach_*` instead of 2 kernel launches per
+  parameter; same math as lightly's `update_momentum`.
+- **`cudnn.benchmark = True`** (trainer_common): input size is fixed.
+- **bs 16 -> 64 default** in the config (bs 128 = the validated ImageNet recipe, same lr).
+
+To measure the model step alone (no dataloader) and get a CUDA op breakdown on the L40S:
+```bash
+PYTHONPATH=. python scripts/profile_step.py                     # current config
+PYTHONPATH=. python scripts/profile_step.py perf.compile=false  # any hydra override
+```
+Compare its img/s against the real loop to tell model-step vs data-pipeline bottlenecks.
+
 ## How to run (after the steps above)
 
 ```bash

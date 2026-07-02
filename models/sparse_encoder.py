@@ -6,15 +6,45 @@
 
 import torch
 import torch.nn as nn
-from timm.models.layers import DropPath
 
 
 _cur_active: torch.Tensor = None            # B1ff
-# todo: try to use `gather` for speed?
+# Per-step cache for the expanded masks: they only depend on (_cur_active, H, W), and every
+# layer of a stage asks for the SAME resolution. Without it, the repeat_interleave (+ the
+# nonzero of the gather variants) is recomputed for every conv/BN at every step. The cache is
+# invalidated whenever `_cur_active` changes identity, so existing code that assigns
+# `sparse_encoder._cur_active = mask` directly keeps working.
+_active_cache: dict = {}
+_active_cache_src: torch.Tensor = None
+
+
+def set_active(mask: torch.Tensor, prefill_sizes=()):
+    """Set the current context mask and optionally prefill the per-resolution cache.
+
+    Prefilling turns every `_get_active_ex_or_ii` call inside the encoder into a cache HIT,
+    which keeps torch.compile'd regions free of cache-mutation side effects.
+    """
+    global _cur_active, _active_cache_src
+    _cur_active = mask
+    _active_cache.clear()
+    _active_cache_src = mask
+    for hw in prefill_sizes:
+        _get_active_ex_or_ii(H=hw, W=hw, returning_active_ex=True)
+
+
 def _get_active_ex_or_ii(H, W, returning_active_ex=True):
-    h_repeat, w_repeat = H // _cur_active.shape[-2], W // _cur_active.shape[-1]
-    active_ex = _cur_active.repeat_interleave(h_repeat, dim=2).repeat_interleave(w_repeat, dim=3)
-    return active_ex if returning_active_ex else active_ex.squeeze(1).nonzero(as_tuple=True)  # ii: bi, hi, wi
+    global _active_cache_src
+    if _active_cache_src is not _cur_active:
+        _active_cache.clear()
+        _active_cache_src = _cur_active
+    key = (H, W, returning_active_ex)
+    out = _active_cache.get(key)
+    if out is None:
+        h_repeat, w_repeat = H // _cur_active.shape[-2], W // _cur_active.shape[-1]
+        active_ex = _cur_active.repeat_interleave(h_repeat, dim=2).repeat_interleave(w_repeat, dim=3)
+        out = active_ex if returning_active_ex else active_ex.squeeze(1).nonzero(as_tuple=True)  # ii: bi, hi, wi
+        _active_cache[key] = out
+    return out
 
 
 def sp_conv_forward(self, x: torch.Tensor):
@@ -25,15 +55,58 @@ def sp_conv_forward(self, x: torch.Tensor):
 
 def sp_bn_forward(self, x: torch.Tensor):
     ii = _get_active_ex_or_ii(H=x.shape[2], W=x.shape[3], returning_active_ex=False)
-    
+
     bhwc = x.permute(0, 2, 3, 1)
     nc = bhwc[ii]                               # select the features on non-masked positions to form a flatten feature `nc`
     nc = super(type(self), self).forward(nc)    # use BN1d to normalize this flatten feature `nc`
-    
+
     bchw = torch.zeros_like(bhwc)
     bchw[ii] = nc
     bchw = bchw.permute(0, 3, 1, 2)
     return bchw
+
+
+def sp_bn_forward_dense(self, x: torch.Tensor):
+    """Masked BatchNorm over the active positions, computed DENSE (no gather/scatter).
+
+    Numerically equivalent to `sp_bn_forward` (gather active pixels into (N, C), BatchNorm1d,
+    scatter back into zeros), but without `nonzero()`, whose data-dependent output size forces
+    a GPU->CPU sync at every BN of every step. Stats are computed in fp32 (matches autocast's
+    handling of batch_norm); masked positions are zeroed in the output exactly like the
+    scatter-into-zeros of the gather version. Equivalence (fwd, grads, running stats, eval) is
+    checked in tests/test_sparse_bn_equivalence.py.
+    """
+    active = _get_active_ex_or_ii(H=x.shape[2], W=x.shape[3], returning_active_ex=True)  # (B,1,H,W)
+    xf = x.float()
+    m = active.to(xf.dtype)
+
+    if self.training or not self.track_running_stats:
+        n = m.sum()
+        mean = (xf * m).sum(dim=(0, 2, 3)) / n                              # (C,)
+        var = ((xf - mean[None, :, None, None]) * m).pow(2).sum(dim=(0, 2, 3)) / n  # biased, like BN
+        if self.training and self.track_running_stats:
+            if self.num_batches_tracked is not None:
+                self.num_batches_tracked.add_(1)
+            momentum = self.momentum
+            if momentum is None:  # cumulative moving average, per _BatchNorm semantics
+                momentum = 1.0 / float(self.num_batches_tracked)
+            with torch.no_grad():
+                var_unbiased = var * (n / (n - 1.0).clamp(min=1.0))
+                self.running_mean.mul_(1.0 - momentum).add_(mean, alpha=momentum)
+                self.running_var.mul_(1.0 - momentum).add_(var_unbiased, alpha=momentum)
+    else:
+        mean = self.running_mean.float()
+        var = self.running_var.float()
+
+    scale = torch.rsqrt(var + self.eps)
+    if self.affine:
+        scale = scale * self.weight.float()
+        shift = self.bias.float() - mean * scale
+    else:
+        shift = -mean * scale
+    out = xf * scale[None, :, None, None] + shift[None, :, None, None]
+    out = out * m
+    return out.to(x.dtype)
 
 
 class SparseConv2d(nn.Conv2d):
@@ -49,10 +122,12 @@ class SparseAvgPooling(nn.AvgPool2d):
 
 
 class SparseBatchNorm2d(nn.BatchNorm1d):
-    forward = sp_bn_forward     # hack: override the forward function; see `sp_bn_forward` above for more details
+    forward = sp_bn_forward_dense   # dense masked BN: no nonzero/gather/scatter (see above)
 
 
 class SparseSyncBatchNorm2d(nn.SyncBatchNorm):
+    # Keeps the gather implementation: SyncBatchNorm.forward carries the cross-rank stats
+    # reduction (DDP), which the dense rewrite does not reimplement.
     forward = sp_bn_forward     # hack: override the forward function; see `sp_bn_forward` above for more details
 
 class SparseConvNeXtLayerNorm(nn.LayerNorm):
@@ -122,6 +197,9 @@ class SparseConvNeXtBlock(nn.Module):
     
     def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6, sparse=True, ks=7):
         super().__init__()
+        # Lazy import: keeps `sparse_encoder` importable with torch alone (unit tests); timm
+        # is only needed when a ConvNeXt block is actually built.
+        from timm.models.layers import DropPath
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=ks, padding=ks//2, groups=dim)  # depthwise conv
         self.norm = SparseConvNeXtLayerNorm(dim, eps=1e-6, sparse=sparse)
         self.pwconv1 = nn.Linear(dim, 4 * dim)  # pointwise/1x1 convs, implemented with linear layers
