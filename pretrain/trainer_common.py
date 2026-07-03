@@ -278,7 +278,7 @@ class LightlyModel(pl.LightningModule):
         if self.cfg.data.num_workers > 0:
             # prefetch_factor=2 (the default): higher values × many workers × large batch hold
             # thousands of 640px tensors in RAM and OOM-kill the process on a 70 GB box.
-            kwargs.update(persistent_workers=True, prefetch_factor=2)
+            kwargs.update(persistent_workers=True, prefetch_factor=1)
         return kwargs
 
     def train_dataloader(self):
@@ -357,6 +357,11 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
     root_dir = os.path.abspath(os.path.join(cfg.artifacts_root, cfg.name))
     version = utils.get_next_version(root_dir)
     ckpt_dir = os.path.join(root_dir, f"version_{version}")
+
+    # Always emit a local CSV of the logged metrics (independent of wandb) so the collapse
+    # watchdog (scripts/watchdog.py) has a robust file to poll for feature_std. Writes to
+    # <ckpt_dir>/csv/metrics.csv.
+    csv_logger = pl.loggers.CSVLogger(save_dir=ckpt_dir, name="csv")
     time.sleep(3) # To allow for other ranks to get the version number right
     if _get_rank() == 0:
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -375,22 +380,32 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
     # Note:
     # - DDP find_unused_parameters=False set because: https://pytorch-lightning.readthedocs.io/en/1.8.6/advanced/model_parallel.html?highlight=find_unused_parameter
     # - DDPStrategy vs DDPSpawnStrategy: https://lightning.ai/docs/pytorch/stable/accelerators/gpu_intermediate.html#distributed-data-parallel-spawn
+    # DDP only makes sense with >1 process. Under SLURM, SLURM_NTASKS gives the process count.
+    # Off SLURM (e.g. a single-GPU Brev/cloud box) SLURM_NTASKS is unset: fall back to the
+    # visible/available GPU count so a 1-GPU run uses the plain single-device strategy instead
+    # of wrapping the model in DDP (which only adds overhead and a rendezvous on one GPU).
     world_size = os.environ.get("SLURM_NTASKS")
     if world_size is not None:
         world_size = int(world_size)
+    else:
+        world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
     print("World size:", world_size, flush=True)
-    if world_size == 1:
-        strategy = None
+    if world_size <= 1:
+        strategy = "auto"  # single device: no DDP wrapper
     else:
         strategy = pl.strategies.DDPStrategy(find_unused_parameters=False)
 
+    loggers = [csv_logger]
+    if cfg.wandb:
+        loggers.insert(0, wandb_logger)
     trainer = pl.Trainer(
-        logger=[wandb_logger] if cfg.wandb else False, 
-        callbacks=callbacks, 
-        strategy=strategy, 
+        logger=loggers,
+        callbacks=callbacks,
+        strategy=strategy,
         num_nodes=os.environ.get("SLURM_NNODES") or 1, # if SLURM_NNODES is not set, we assume 1 node
         **cfg.trainer,
     )
+    print("CSV metrics ->", os.path.join(csv_logger.log_dir, "metrics.csv"), flush=True)
     trainer.fit(model=model)
 
 if __name__ == "__main__":

@@ -65,26 +65,30 @@ trainer:
   accumulate_grad_batches: null
   overfit_batches: 0.0
 
-# Perf knobs (L40S). channels_last: NHWC layout for tensor-core convs. compile:
+# Perf knobs (A100 80GB). channels_last: NHWC layout for tensor-core convs. compile:
 # false | "dense" (teacher/tail/predictors only) | "all" (also the sparse student trunk).
 # First step pays a few minutes of compile warmup; set compile: false when debugging
 # stack traces. If TORCH_LOGS=recompiles shows churn on torch 2.0.x, use "dense".
+# NOTE: start at "dense" for the first end-to-end run (safe, no global-cache-in-graph risk);
+# switch to "all" once a few steps are confirmed stable and you want the extra trunk speedup.
 perf:
   channels_last: true
-  compile: "all"
+  compile: "dense"
 
 optimizer:
-  # 64 fills ~1/3 of the L40S (48 GB) at 640px; per-step costs (mask sampling, EMA, launches)
-  # amortize over the batch, and bs 128 = the validated ImageNet recipe (same lr 0.01).
-  batch_size: 64
-  lr: 0.01
+  # A100 80GB @ 640px. Measured: bs 192 -> peak 53 GiB (profile_step.py), so ~27 GiB headroom.
+  # lr from the linear scaling rule off the known-good point (bs 64 / lr 0.001): 0.001*192/64.
+  # The collapse watchdog (scripts/watchdog.py) passes lr as an override and halves it on each
+  # relaunch, so this is just the default base.
+  batch_size: 192
+  lr: 0.003
   weight_decay: 0.01
   cosine_warmpup_sched: True
   lr_warmup_epochs: 10
   exclude_norm_and_bias_from_wd: False
   wd_schedule: False
 
-wandb: true
+wandb: false
 
 hydra:
   output_subdir: null

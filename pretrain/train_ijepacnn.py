@@ -256,10 +256,28 @@ class IJEPA_CNN(LightlyModelMomentum):
             loss_ctx = per_pos.mul(ctx).sum() / (ctx.sum() + 1e-8)
         return loss_pred, loss_ctx
 
+    @torch.no_grad()
+    def _log_feature_std(self, h, metric_label):
+        """Collapse detector: std of the (unnormalized) target-encoder features across the batch.
+
+        JEPA collapse is silent in the loss (predictor and target both drift to a constant, so
+        the loss happily goes to ~0). The tell is the per-dimension std of the EMA target's
+        features collapsing toward 0. We log the mean over channels of the per-(dim) std,
+        computed over the batch+spatial positions. A healthy run keeps this well above 0; a
+        sustained drop toward 0 is the collapse signal the watchdog watches. `h` may be a dict
+        (deep supervision) -> use the final level.
+        """
+        feat = h["final"] if isinstance(h, dict) else h  # (B, C, f, f)
+        feat = feat.float()
+        # std per channel over (batch, height, width), then averaged over channels.
+        std = feat.permute(1, 0, 2, 3).reshape(feat.shape[1], -1).std(dim=1).mean()
+        self.log(f"{metric_label}/feature_std", std, on_epoch=True)
+
     def train_val_step(self, batch, batch_idx, metric_label="train_metrics"):
         x = batch[0]
         p, context_mask_b1ff, target_mask_b1ff = self.forward(x)
         h = self.forward_momentum(x)
+        self._log_feature_std(h, metric_label)
         loss_pred, loss_ctx = self._jepa_level_loss(p, h, context_mask_b1ff, target_mask_b1ff)
         loss = loss_pred
         self.log(f"{metric_label}/ijepa_loss", loss_pred, on_epoch=True)

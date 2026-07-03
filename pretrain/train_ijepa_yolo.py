@@ -16,6 +16,8 @@ import math
 import hydra
 from omegaconf import DictConfig
 import torch
+import torch._dynamo  # noqa: F401  (loads the submodule so torch._dynamo.config exists; must be
+                      # module-level, not inside _apply_perf_options, or it rebinds `torch` local)
 from torch import nn
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
@@ -114,7 +116,8 @@ class IJEPA_YOLO(IJEPA_CNN):
             print("perf.compile requested but torch.compile unavailable (torch<2.0); skipping.", flush=True)
             return
         if compile_opt:
-            import torch._dynamo
+            # torch._dynamo is imported at module level (a local import here would rebind the
+            # name `torch` and break the channels_last block above with UnboundLocalError).
             # A dynamo/inductor failure must not kill a multi-day run: log + fall back to eager.
             torch._dynamo.config.suppress_errors = True
             self.backbone.forward_tail = torch.compile(self.backbone.forward_tail)
@@ -240,6 +243,7 @@ class IJEPA_YOLO(IJEPA_CNN):
         x = batch[0]
         p_levels, context_mask_b1ff, target_mask_b1ff = self.forward(x)
         h_levels = self.forward_momentum(x)
+        self._log_feature_std(h_levels, metric_label)  # collapse detector (final-level std)
         lam = self._lambda_eff()
         # The context distance weight only depends on the masks: compute it once, not per level.
         cl = self.cfg.get("context_loss", None)
