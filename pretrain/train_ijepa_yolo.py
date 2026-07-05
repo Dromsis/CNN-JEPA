@@ -1,44 +1,38 @@
 # CNN-JEPA pretraining for the YOLO26-SEA backbone.
 #
-# Variant of pretrain/train_ijepacnn.IJEPA_CNN. The ONLY architectural difference is WHERE
-# the densify (fill-in mask tokens) happens:
-#
-#   IJEPA_CNN (ResNet/ConvNeXt):  masked -> [sparse backbone ENTIER] -> densify -> predictor
-#   IJEPA_YOLO (this file):       masked -> [sparse trunk 0-8] -> densify -> [dense tail 9-11] -> predictor
-#
-# The tail (SESA, SPPF, C2PSA) mixes information globally, so it must run on a DENSE feature
-# map. We therefore densify right after the trunk and let the tail run normally. Masking,
-# EMA target encoder, loss and the whole training loop are inherited unchanged.
+# Independent implementation of YOLO-JEPA pretraining.
+# The trunk (layers 0-8) runs SPARSE, and the tail (9-11: SESA, SPPF, C2PSA) runs DENSE.
+# The training loop, masking, and loss are self-contained.
 
 import copy
 import math
+import os
+import sys
+from typing import Optional
 
 import hydra
 from omegaconf import DictConfig
 import torch
-import torch._dynamo  # noqa: F401  (loads the submodule so torch._dynamo.config exists; must be
-                      # module-level, not inside _apply_perf_options, or it rebinds `torch` local)
+import torch._dynamo
 from torch import nn
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 from lightly.models.utils import deactivate_requires_grad, update_momentum
 from lightly.utils.scheduler import cosine_schedule
+from lightly.transforms.ijepa_transform import IJEPATransform
 
 from pretrain.trainer_common import LightlyModel, LightlyModelMomentum, main_pretrain
-from pretrain.train_ijepacnn import IJEPA_CNN
 import models.sparse_encoder as sparse_encoder
+from pretrain.ijepa_mask import MultiBlockMask
 
 # Import to register `yolo26_sea_backbone` in the timm model registry (used by the base
 # LightlyModel via timm.create_model(cfg.backbone.name, ...)).
 import models.yolo_backbone  # noqa: F401
 
 
-class IJEPA_YOLO(IJEPA_CNN):
+class IJEPA_YOLO(LightlyModelMomentum):
     def __init__(self, cfg: DictConfig):
         # Build self.backbone (YOLO26SEABackbone) + self.backbone_momentum (dense deepcopy).
-        # We deliberately bypass IJEPA_CNN.__init__ because it sparse-converts the WHOLE
-        # backbone and sizes the mask token at the final feature dim — both wrong for the
-        # split (trunk-sparse / tail-dense) design.
         LightlyModelMomentum.__init__(self, cfg)
 
         # Sparse-convert ONLY the trunk (layers 0-8). The tail (9-11) stays dense.
@@ -106,19 +100,11 @@ class IJEPA_YOLO(IJEPA_CNN):
                 mod.to(memory_format=torch.channels_last)
 
         # compile: false | "dense" | "all"/true
-        #   "dense" -> teacher + tail + predictors (no global state, always safe)
-        #   "all"   -> also the sparse student trunk. Its conv/BN wrappers READ the mask cache,
-        #              which forward() prefills per step, so compiled regions never mutate it.
-        #              On torch 2.0.x check TORCH_LOGS=recompiles once; fall back to "dense"
-        #              if graphs churn.
         compile_opt = perf.get("compile", False)
         if compile_opt and not hasattr(torch, "compile"):
             print("perf.compile requested but torch.compile unavailable (torch<2.0); skipping.", flush=True)
             return
         if compile_opt:
-            # torch._dynamo is imported at module level (a local import here would rebind the
-            # name `torch` and break the channels_last block above with UnboundLocalError).
-            # A dynamo/inductor failure must not kill a multi-day run: log + fall back to eager.
             torch._dynamo.config.suppress_errors = True
             self.backbone.forward_tail = torch.compile(self.backbone.forward_tail)
             self.backbone_momentum.forward_trunk = torch.compile(self.backbone_momentum.forward_trunk)
@@ -132,14 +118,60 @@ class IJEPA_YOLO(IJEPA_CNN):
             if compile_opt is True or compile_opt == "all":
                 self.backbone.forward_trunk = torch.compile(self.backbone.forward_trunk)
 
+    def setup_transform(self):
+        self.transform = IJEPATransform(self.input_size)
+
+    def setup(self, stage: str) -> None:
+        super().setup(stage)
+        self._setup_masking(self.input_size)
+
     def _setup_masking(self, input_size: int) -> None:
-        super()._setup_masking(input_size)
+        """Derive the mask geometry from the input size."""
+        self.input_size = input_size
+        self.downsample_raito = self.backbone.get_downsample_ratio()
+        self.fmap_h, self.fmap_w = self.input_size // self.downsample_raito, self.input_size // self.downsample_raito
+        self.len_keep = round(self.fmap_h * self.fmap_w * (1 - self.cfg.mask_ratio))
+        self.multi_block_mask = MultiBlockMask(
+            input_size=self.input_size,
+            patch_size=self.downsample_raito,
+            **self.cfg.mask.mutli_block_kwargs
+        )
         # Every resolution the sparse trunk produces (stride 2..32 -> fmap*16..fmap*1), plus
         # the input resolution (fmap*32) used to mask the image itself. forward() prefills the
         # sparse-mask cache with these once per step.
         self._prefill_sizes = tuple(
             self.fmap_h * (2 ** i) for i in range(int(math.log2(self.downsample_raito)) + 1)
         )
+
+    def mask(self, B: int, device, generator=None):
+        if self.cfg.mask.strategy == "mixed":
+            if torch.rand(1) < self.cfg.mask.mixed_mutli_block_ratio:
+                strategy = "multi-block"
+            else:
+                strategy = "random"
+        else:
+            strategy = self.cfg.mask.strategy
+        if strategy == "random":
+            h, w = self.fmap_h, self.fmap_w
+            idx = torch.rand(B, h * w, generator=generator).argsort(dim=1)
+            idx = idx[:, :self.len_keep].to(device)  # (B, len_keep)
+            context_mask = torch.zeros(B, h * w, dtype=torch.bool, device=device).scatter_(dim=1, index=idx, value=True).view(B, 1, h, w)
+            target_mask = context_mask.logical_not()
+            return context_mask, target_mask   
+        elif strategy == "multi-block":
+            context_mask, target_mask = self.multi_block_mask(B)
+            context_mask = context_mask.unsqueeze(1).to(device, dtype=torch.bool)
+            target_mask = target_mask.unsqueeze(1).to(device, dtype=torch.bool)
+            return context_mask, target_mask
+
+    def get_views_to_log_from_batch(self, batch):
+        inp_bchw = batch[0]
+        context_mask_b1ff, target_mask_b1ff = self.mask(inp_bchw.shape[0], inp_bchw.device)  # (B, 1, f, f)
+        context_mask_b1hw = context_mask_b1ff.repeat_interleave(self.downsample_raito, 2).repeat_interleave(self.downsample_raito, 3)  # (B, 1, H, W)
+        target_mask_b1hw  =  target_mask_b1ff.repeat_interleave(self.downsample_raito, 2).repeat_interleave(self.downsample_raito, 3)  # (B, 1, H, W)
+        context_bchw = inp_bchw * context_mask_b1hw
+        target_bchw = inp_bchw * target_mask_b1hw
+        return [inp_bchw, context_bchw, target_bchw]
 
     @torch.no_grad()
     def _ema_update(self, m: float):
@@ -157,8 +189,6 @@ class IJEPA_YOLO(IJEPA_CNN):
         torch._foreach_add_(ema, src, alpha=1.0 - m)
 
     def training_step(self, batch, batch_idx):
-        # Replicates LightlyModelMomentum.training_step with the fused EMA (skip over the
-        # parent on purpose; keep in sync with trainer_common if that method changes).
         momentum = cosine_schedule(self.current_epoch, self.cfg.trainer.max_epochs, 0.996, 1)
         self._ema_update(momentum)
         if self.projection_head_momentum is not None:
@@ -174,9 +204,6 @@ class IJEPA_YOLO(IJEPA_CNN):
                 layers.append(nn.Conv2d(c, c, kernel_size=1, padding="same"))
             else:
                 layers.append(nn.Conv2d(c, c, self.cfg.predictor.kernel_size, padding="same"))
-            # No norm/ReLU on the LAST layer: the predictor must output raw (possibly negative)
-            # features to match the target encoder's embeddings. A final ReLU would clamp the
-            # prediction to >=0 and cripple the JEPA loss.
             if i < n_layers - 1:
                 layers.append(norm_cls(c))
                 layers.append(nn.ReLU(inplace=True))
@@ -186,9 +213,6 @@ class IJEPA_YOLO(IJEPA_CNN):
         inp_bchw = x
         if self._channels_last:
             inp_bchw = inp_bchw.contiguous(memory_format=torch.channels_last)
-        # step 1. Mask (coarse, at stride-32 patch level). set_active prefills the expanded
-        # masks for every trunk resolution, so all lookups inside the (possibly compiled)
-        # sparse trunk are cache hits.
         context_mask_b1ff, target_mask_b1ff = self.mask(inp_bchw.shape[0], inp_bchw.device)
         sparse_encoder.set_active(context_mask_b1ff, prefill_sizes=getattr(self, "_prefill_sizes", ()))
         active_b1hw = sparse_encoder._get_active_ex_or_ii(
@@ -196,34 +220,26 @@ class IJEPA_YOLO(IJEPA_CNN):
         )
         masked_bchw = inp_bchw * active_b1hw
 
-        # step 2. Encode the SPARSE trunk (0-8). Masked positions stay zeroed throughout.
         trunk_feat = self.backbone.forward_trunk(masked_bchw)  # (B, trunk_ch, f, f)
 
-        # step 3. DENSIFY: fill masked (non-active) positions with the learned mask token.
         mask_tokens = self.mask_token.expand_as(trunk_feat)
         trunk_dense = torch.where(
             context_mask_b1ff.expand_as(trunk_feat), trunk_feat, mask_tokens.to(trunk_feat.dtype)
         )
 
-        # step 4. DENSE tail (SESA -> SPPF -> C2PSA). No leakage now: the map is fully filled.
         feat = self.backbone.forward_tail(trunk_dense)  # (B, num_features, f, f)
 
-        # step 4.5. Project (student projection head, if enabled).
         if self.projection_head is not None:
             feat = self.projection_head(feat)
 
-        # step 5. Predict masked-region embeddings.
         z = self.predictor(feat)
 
         if self.deep_supervision:
-            # Aux prediction at the trunk (layer-8) level, from the densified trunk features.
             z_trunk = self.predictor_trunk(trunk_dense)
             return {"trunk": z_trunk, "final": z}, context_mask_b1ff, target_mask_b1ff
         return z, context_mask_b1ff, target_mask_b1ff
 
     def forward_momentum(self, x):
-        # EMA target encoder = full DENSE backbone on the unmasked image. Always composed as
-        # trunk -> tail so both halves hit the (possibly compiled) method wrappers.
         if self._channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
         trunk_out = self.backbone_momentum.forward_trunk(x)
@@ -234,33 +250,89 @@ class IJEPA_YOLO(IJEPA_CNN):
             return {"trunk": trunk_out.detach(), "final": final.detach()}
         return final.detach()
 
-    def train_val_step(self, batch, batch_idx, metric_label="train_metrics"):
-        # Single-level path (incl. the V-JEPA 2.1 context loss) is handled by the parent.
-        if not self.deep_supervision:
-            return super().train_val_step(batch, batch_idx, metric_label)
+    @staticmethod
+    @torch.no_grad()
+    def _context_distance_weight(target_mask_b1ff):
+        m = target_mask_b1ff.to(torch.float32)
+        f = m.shape[-1]
+        dist = torch.zeros_like(m)
+        covered = m.clone()
+        cur = m
+        for d in range(1, f + 1):
+            cur = F.max_pool2d(cur, kernel_size=3, stride=1, padding=1)
+            newly = (cur > 0) & (covered == 0)
+            dist = dist + d * newly.to(dist.dtype)
+            covered = covered + newly.to(covered.dtype)
+        dist = torch.where(covered > 0, dist, torch.full_like(dist, float(f)))
+        return 1.0 / torch.sqrt(dist.clamp(min=1.0))
 
-        # Deep Self-Supervision: sum the JEPA loss (masked + context) over all levels.
-        x = batch[0]
-        p_levels, context_mask_b1ff, target_mask_b1ff = self.forward(x)
-        h_levels = self.forward_momentum(x)
-        self._log_feature_std(h_levels, metric_label)  # collapse detector (final-level std)
-        lam = self._lambda_eff()
-        # The context distance weight only depends on the masks: compute it once, not per level.
+    def _lambda_eff(self):
         cl = self.cfg.get("context_loss", None)
-        ctx_w = None
+        if cl is None or not cl.get("enabled", False):
+            return 0.0
+        lam = float(cl.get("lambda", 0.5))
+        warm = int(cl.get("warmup_epochs", 0))
+        return lam * min(1.0, (self.current_epoch + 1) / warm) if warm > 0 else lam
+
+    def _jepa_level_loss(self, p, h, context_mask_b1ff, target_mask_b1ff, ctx_weight=None):
+        p = F.normalize(p, dim=1)
+        h = F.normalize(h, dim=1)
+        per_pos = F.smooth_l1_loss(p, h, reduction='none').sum(axis=1, keepdim=True)  # (B,1,f,f)
+        tgt = target_mask_b1ff.to(per_pos.dtype)
+        loss_pred = per_pos.mul(tgt).sum() / (tgt.sum() + 1e-8)  # masked patches (original JEPA)
+        loss_ctx = None
+        cl = self.cfg.get("context_loss", None)
         if cl is not None and cl.get("enabled", False):
-            ctx_w = self._context_distance_weight(target_mask_b1ff)
-        total = 0.0
-        for name in p_levels:
-            loss_pred, loss_ctx = self._jepa_level_loss(
-                p_levels[name], h_levels[name], context_mask_b1ff, target_mask_b1ff, ctx_weight=ctx_w)
-            level_loss = loss_pred + (lam * loss_ctx if loss_ctx is not None else 0.0)
-            total = total + level_loss
-            self.log(f"{metric_label}/ijepa_loss_{name}", loss_pred, on_epoch=True)
+            w = ctx_weight if ctx_weight is not None else self._context_distance_weight(target_mask_b1ff)
+            ctx = context_mask_b1ff.to(per_pos.dtype) * w
+            loss_ctx = per_pos.mul(ctx).sum() / (ctx.sum() + 1e-8)
+        return loss_pred, loss_ctx
+
+    @torch.no_grad()
+    def _log_feature_std(self, h, metric_label):
+        feat = h["final"] if isinstance(h, dict) else h  # (B, C, f, f)
+        feat = feat.float()
+        std = feat.permute(1, 0, 2, 3).reshape(feat.shape[1], -1).std(dim=1).mean()
+        self.log(f"{metric_label}/feature_std", std, on_epoch=True)
+
+    def train_val_step(self, batch, batch_idx, metric_label="train_metrics"):
+        if self.deep_supervision:
+            # Deep Self-Supervision: sum the JEPA loss (masked + context) over all levels.
+            x = batch[0]
+            p_levels, context_mask_b1ff, target_mask_b1ff = self.forward(x)
+            h_levels = self.forward_momentum(x)
+            self._log_feature_std(h_levels, metric_label)
+            lam = self._lambda_eff()
+            cl = self.cfg.get("context_loss", None)
+            ctx_w = None
+            if cl is not None and cl.get("enabled", False):
+                ctx_w = self._context_distance_weight(target_mask_b1ff)
+            total = 0.0
+            for name in p_levels:
+                loss_pred, loss_ctx = self._jepa_level_loss(
+                    p_levels[name], h_levels[name], context_mask_b1ff, target_mask_b1ff, ctx_weight=ctx_w)
+                level_loss = loss_pred + (lam * loss_ctx if loss_ctx is not None else 0.0)
+                total = total + level_loss
+                self.log(f"{metric_label}/ijepa_loss_{name}", loss_pred, on_epoch=True)
+                if loss_ctx is not None:
+                    self.log(f"{metric_label}/ctx_loss_{name}", loss_ctx, on_epoch=True)
+            self.log(f"{metric_label}/loss", total, on_epoch=True)
+            return total
+        else:
+            x = batch[0]
+            p, context_mask_b1ff, target_mask_b1ff = self.forward(x)
+            h = self.forward_momentum(x)
+            self._log_feature_std(h, metric_label)
+            loss_pred, loss_ctx = self._jepa_level_loss(p, h, context_mask_b1ff, target_mask_b1ff)
+            loss = loss_pred
+            self.log(f"{metric_label}/ijepa_loss", loss_pred, on_epoch=True)
             if loss_ctx is not None:
-                self.log(f"{metric_label}/ctx_loss_{name}", loss_ctx, on_epoch=True)
-        self.log(f"{metric_label}/loss", total, on_epoch=True)
-        return total
+                lam = self._lambda_eff()
+                loss = loss_pred + lam * loss_ctx
+                self.log(f"{metric_label}/ctx_loss", loss_ctx, on_epoch=True)
+                self.log(f"{metric_label}/ctx_lambda", lam, on_epoch=True)
+            self.log(f"{metric_label}/loss", loss, on_epoch=True)
+            return loss
 
 
 @hydra.main(version_base="1.2", config_path="configs/", config_name="ijepacnn_yolo_maritime.yaml")

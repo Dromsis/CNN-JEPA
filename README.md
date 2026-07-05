@@ -41,22 +41,11 @@ Baseline implementations of the following pretraining approaches are also provid
 
 ## Setup
 
-We recommend using the provided Docker container to run the code.
+Pour configurer le projet et l'exécuter sur un serveur Brev :
 
-### Option A: Start Docker container and connect to it via ssh:
-1. Create a keypair, copy the public key to the root of this repo, and edit the Dockerfile accordingly.
-2. Run `make ssh`.
-3. Connect on port 2222 `ssh root@<hostname> -i <private_key_path> -p 2222`.
+Suivez scrupuleusement les étapes décrites dans le guide de configuration [run_on_brev.txt](file:///home/dromsis/Documents/CNN-JEPA/run_on_brev.txt).
 
-Alternatively, to run the container without starting an ssh server, run `make run`.
 
-To customize Docker build and run, edit the [Makefile](Makefile) or the [Dockerfile](Dockerfile).
-
-> :warning: `make ssh` and `make run` start the container with the `--rm` flag! Only contents of the `/workspace` persist if the container is stopped (via a simple volume mount)!
-
-### Option B: Install dependencies locally (not tested)
-
-Install the requirements with `pip install -r requirements.txt`.
 
 ## Datasets
 

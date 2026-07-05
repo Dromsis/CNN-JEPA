@@ -1,0 +1,95 @@
+======================================================================
+PROCÉDURE OBLIGATOIRE D'INSTALLATION ET D'EXÉCUTION SUR BREV.DEV
+======================================================================
+
+Suivez scrupuleusement les étapes suivantes dans l'ordre pour transférer
+le projet, configurer les données (via archive TAR rapide) et lancer
+l'entraînement.
+
+----------------------------------------------------------------------
+ÉTAPE 1 : SUR VOTRE PC LOCAL - TRANSFÉRER LE CODE
+----------------------------------------------------------------------
+Depuis le dossier racine du projet sur votre PC local, exécutez la commande
+suivante pour envoyer le code vers le serveur Brev :
+
+rsync -avz --exclude="venv" --exclude=".git" --exclude="*.png" --exclude="*.log" -e "ssh" . username@your-brev-instance:~/CNN-JEPA
+
+*(Remplacez username@your-brev-instance par vos accès de connexion SSH Brev)*
+
+----------------------------------------------------------------------
+ÉTAPE 2 : SUR VOTRE PC LOCAL - TRANSFÉRER LA CONFIGURATION DE RCLONE
+----------------------------------------------------------------------
+Pour copier vos identifiants Cloudflare R2 locaux vers le serveur Brev :
+
+1. Créez le dossier de configuration sur le serveur :
+ssh username@your-brev-instance "mkdir -p ~/.config/rclone"
+
+2. Copiez le fichier rclone.conf :
+scp ~/.config/rclone/rclone.conf username@your-brev-instance:~/.config/rclone/rclone.conf
+
+----------------------------------------------------------------------
+ÉTAPE 3 : SUR LE SERVEUR BREV - INSTALLER LES DÉPENDANCES SYSTÈME
+----------------------------------------------------------------------
+Connectez-vous en SSH à votre instance Brev et exécutez :
+
+sudo apt-get update && sudo apt-get install -y \
+    git curl wget build-essential cmake \
+    libsm6 libxrender1 libfontconfig1 libxext6 libgl1 ffmpeg \
+    tmux nano htop
+
+----------------------------------------------------------------------
+ÉTAPE 4 : SUR LE SERVEUR BREV - TÉLÉCHARGER LE DATASET HDF5
+----------------------------------------------------------------------
+Téléchargez les fichiers HDF5 du dataset depuis votre R2 (rapide et prêt
+à l'emploi sans extraction) :
+
+1. Création des dossiers :
+sudo mkdir -p /data
+sudo chown -R $USER /data
+
+2. Téléchargement des fichiers HDF5 depuis R2 :
+rclone copy r2:sea-vis-data-fan/maritime-train.h5 /data/ --progress
+rclone copy r2:sea-vis-data-fan/maritime-val.h5 /data/ --progress
+
+----------------------------------------------------------------------
+ÉTAPE 5 : SUR LE SERVEUR BREV - CONFIGURER L'ENVIRONNEMENT PYTHON
+----------------------------------------------------------------------
+Allez dans le dossier du projet, créez l'environnement virtuel et activez-le :
+
+cd ~/CNN-JEPA
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+
+----------------------------------------------------------------------
+ÉTAPE 6 : SUR LE SERVEUR BREV - INSTALLER LES PACKAGES PYTHON
+----------------------------------------------------------------------
+Installez PyTorch 2.0.1 compatible avec CUDA 11.8 puis les autres dépendances :
+
+1. PyTorch (requis pour compatibilité avec pytorch-lightning 1.9.5 sur GPU L40S) :
+pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+
+2. Autres dépendances :
+pip install -r requirements-l40s.txt
+
+----------------------------------------------------------------------
+ÉTAPE 7 : SUR LE SERVEUR BREV - DÉMARRER L'ENTRAÎNEMENT
+----------------------------------------------------------------------
+Lancez l'entraînement YOLO-JEPA sur le dataset Maritime :
+
+PYTHONPATH=. python pretrain/train_ijepa_yolo.py --config-name ijepacnn_yolo_maritime.yaml
+
+
+======================================================================
+COMMENT CRÉER ET ENVOYER LES FICHIERS HDF5 (.H5) SUR R2 (À FAIRE UNE SEULE FOIS)
+======================================================================
+Les fichiers HDF5 sont générés localement sur votre PC personnel en exécutant le script dédié :
+
+1. Exécutez le script de conversion localement sur votre PC :
+   python3 scripts/create_hdf5_maritime.py
+
+2. Envoyez les deux fichiers .h5 générés sur votre R2 :
+   rclone copy /home/dromsis/Pictures/dataset/combined/maritime-train.h5 r2:sea-vis-data-fan/ --progress
+   rclone copy /home/dromsis/Pictures/dataset/combined/maritime-val.h5 r2:sea-vis-data-fan/ --progress
+
+Une fois ces opérations effectuées, vos instances Brev utiliseront directement ces fichiers pour l'entraînement.

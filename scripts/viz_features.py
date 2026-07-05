@@ -43,7 +43,7 @@ def pca_rgb(fmap):  # fmap: (C, H, W) tensor
     # top-3 principal components via SVD
     u, s, vt = np.linalg.svd(x, full_matrices=False)
     proj = x @ vt[:3].T  # (HW, 3)
-    proj = (proj - proj.min(0)) / (proj.ptp(0) + 1e-8)
+    proj = (proj - proj.min(0)) / (proj.max(0) - proj.min(0) + 1e-8)
     return proj.reshape(h, w, 3)
 
 

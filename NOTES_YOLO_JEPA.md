@@ -51,7 +51,7 @@ matches inference (no mask at finetune time -> SESA always sees a dense map).
 
 1. **Ultralytics import path.** `models/yolo_backbone.py` needs the vendored `ultralytics`
    package importable. Either set `backbone.kwargs.yolo_repo_path` (already in the config) or
-   `export YOLO_SEA_REPO=/home/enzobel/Documents/yolo_sea_homemade`.
+   `export YOLO_SEA_REPO=/home/dromsis/Documents/yolo_sea_homemade`.
 
 2. **Maritime dataset wiring.** `pretrain/trainer_common.py::setup()` hardcodes datasets in
    per-name dicts. Add a `"maritime"` entry:
@@ -103,8 +103,8 @@ Compare its img/s against the real loop to tell model-step vs data-pipeline bott
 ## How to run (after the steps above)
 
 ```bash
-cd /home/enzobel/Documents/CNN-JEPA
-export YOLO_SEA_REPO=/home/enzobel/Documents/yolo_sea_homemade   # if not using yolo_repo_path
+cd /home/dromsis/Documents/CNN-JEPA
+export YOLO_SEA_REPO=/home/dromsis/Documents/yolo_sea_homemade   # if not using yolo_repo_path
 PYTHONPATH=. python pretrain/train_ijepa_yolo.py --config-name ijepacnn_yolo_maritime.yaml
 ```
 

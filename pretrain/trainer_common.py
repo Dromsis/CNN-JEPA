@@ -40,7 +40,6 @@ from pretrain.metrics import contrastive_acc_eval, log_example_inputs, eval_feat
 from pretrain.online_classification_benchmark import OnlineLinearClassificationBenckmark
 import utils
 
-from data.imagenette import Imagenette
 from data.hdf5_imagefolder import HDF5ImageFolder
 from data.flat_image_folder import FlatImageFolder
 
@@ -192,50 +191,22 @@ class LightlyModel(pl.LightningModule):
 
     def setup(self, stage: str) -> None:
         dataset_classes = {
-            "cifar10": torchvision.datasets.CIFAR10,
-            "stl10": torchvision.datasets.STL10,
-            "tiny-imagenet": torchvision.datasets.ImageFolder,
-            "imagenette": Imagenette,
-            "imagenet-100": HDF5ImageFolder, # Replaceable with torchvision.datasets.ImageFolder
-            "imagenet-1k":  HDF5ImageFolder, # Replaceable with torchvision.datasets.ImageFolder
-            "maritime": FlatImageFolder, # flat, label-free dir of images (combined/images/<split>)
+            "maritime": HDF5ImageFolder, # flat, label-free dir of images packaged in HDF5 format
         }
+        import os
+        maritime_train_path = "/home/dromsis/Pictures/dataset/combined/maritime-train.h5" if os.path.exists("/home/dromsis/Pictures/dataset/combined/maritime-train.h5") else "/data/maritime-train.h5"
+        maritime_val_path = "/home/dromsis/Pictures/dataset/combined/maritime-val.h5" if os.path.exists("/home/dromsis/Pictures/dataset/combined/maritime-val.h5") else "/data/maritime-val.h5"
+
         train_dataset_kwargs = {
-            "cifar10": dict(root="/data/cifar10", download=True),
-            "stl10": dict(root="/data/stl10", download=True, split='train+unlabeled'),
-            "tiny-imagenet": dict(root="/data/tiny-imagenet-200/train"),
-            "imagenette": dict(root="/data/imagenette", split='train', download=True),
-            "imagenet-100": dict(root="/data/imagenet-100-train.h5"),
-            "imagenet-1k": dict(root="/data/imagenet-train.h5"),
-            # All images under combined/images/train (flat, ~121k). YOLO labels ignored.
-            "maritime": dict(root="/data/combined/images/train"),
+            "maritime": dict(root=maritime_train_path),
         }
         val_dataset_kwargs = {
-            "cifar10": dict(root="/data/cifar10", train=False),
-            "stl10": dict(root="/data/stl10", split='test'),
-            "tiny-imagenet": dict(root="/data/tiny-imagenet-200/val"),
-            "imagenette": dict(root="/data/imagenette", split='val'),
-            "imagenet-100": dict(root="/data/imagenet-100-val.h5"),
-            "imagenet-1k": dict(root="/data/imagenet-val.h5"),
-            # val split, only used for the JEPA val loss.
-            "maritime": dict(root="/data/combined/images/val"),
+            "maritime": dict(root=maritime_val_path),
         }
         input_sizes = {
-            "cifar10": 32,
-            "stl10":  96,
-            "tiny-imagenet": 64,
-            "imagenette": 224,
-            "imagenet-100": 224,
-            "imagenet-1k": 224,
             "maritime": 640,
         }
         num_classes = {
-            "cifar10": 10,
-            "stl10":  10,
-            "tiny-imagenet": 200,
-            "imagenette": 10,
-            "imagenet-100": 100,
-            "imagenet-1k": 1000,
             "maritime": 1, # dummy; data is unlabeled (FlatImageFolder returns label 0)
         }
         self.dataset_class = dataset_classes[self.cfg.data.dataset_name]
@@ -257,8 +228,6 @@ class LightlyModel(pl.LightningModule):
         )
 
         lin_benchmark_train_kwargs = self.train_dataset_kwargs.copy()
-        if self.cfg.data.dataset_name == "stl10":
-            lin_benchmark_train_kwargs["split"] = "train"
         self.online_classifier = OnlineLinearClassificationBenckmark(
             backbone=self.backbone_for_online_eval,
             num_classes=self.num_classes, 

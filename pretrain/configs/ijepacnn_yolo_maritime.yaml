@@ -24,10 +24,10 @@ backbone:
   pretrained_weights: null
   kwargs:
     # Path to the yolo26-sea.yaml in the yolo_sea_homemade repo:
-    yaml_path: "/home/enzobel/Documents/yolo_sea_homemade/ultralytics/cfg/models/26/yolo26-sea.yaml"
+    yaml_path: "/home/dromsis/Documents/yolo_sea_homemade/ultralytics/cfg/models/26/yolo26-sea.yaml"
     scale: "s"
     # Repo root so the vendored `ultralytics` package is importable (or set YOLO_SEA_REPO env):
-    yolo_repo_path: "/home/enzobel/Documents/yolo_sea_homemade"
+    yolo_repo_path: "/home/dromsis/Documents/yolo_sea_homemade"
     in_chans: 3
 
 predictor:
