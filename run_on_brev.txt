@@ -79,6 +79,16 @@ Lancez l'entraînement YOLO-JEPA sur le dataset Maritime :
 
 PYTHONPATH=. python pretrain/train_ijepa_yolo.py --config-name ijepacnn_yolo_maritime.yaml
 
+*(Note sur la compilation PyTorch (torch.compile) pour accélérer l'entraînement)* :
+Par défaut, la compilation est réglée sur "dense" dans la configuration YAML.
+Vous pouvez ajuster ce comportement à la volée depuis la commande avec le paramètre `perf.compile` :
+- `perf.compile="all"`   : (Recommandé pour la vitesse maximale) Compile l'ensemble du modèle (backbone sparse + predictor). Permet d'atteindre ~30h d'entraînement.
+- `perf.compile="dense"` : (Par défaut) Compile uniquement les parties denses (plus stable, évite les recompilations).
+- `perf.compile=false`   : Désactive la compilation (démarrage instantané, utile pour tester rapidement si le code tourne sans attendre le temps de compilation).
+
+Exemple pour lancer avec la vitesse maximale :
+PYTHONPATH=. python pretrain/train_ijepa_yolo.py --config-name ijepacnn_yolo_maritime.yaml perf.compile="all"
+
 
 ======================================================================
 COMMENT CRÉER ET ENVOYER LES FICHIERS HDF5 (.H5) SUR R2 (À FAIRE UNE SEULE FOIS)

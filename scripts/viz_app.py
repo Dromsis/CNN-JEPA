@@ -16,8 +16,8 @@ import gradio as gr
 import matplotlib
 
 DEFAULT_CKPT = "/home/dromsis/Documents/jepa_yolo_20ep.ckpt"
-DEFAULT_YAML = "/home/dromsis/Documents/yolo_sea_homemade/ultralytics/cfg/models/26/yolo26-sea.yaml"
-DEFAULT_YOLO_REPO = "/home/dromsis/Documents/yolo_sea_homemade"
+DEFAULT_YAML = "ultralytics/cfg/models/26/yolo26-sea.yaml"
+DEFAULT_YOLO_REPO = "."
 
 # Ensure Ultralytics can be imported
 def _ensure_ultralytics(repo):
