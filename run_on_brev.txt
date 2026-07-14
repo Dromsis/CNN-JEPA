@@ -12,7 +12,7 @@ l'entraînement.
 Depuis le dossier racine du projet sur votre PC local, exécutez la commande
 suivante pour envoyer le code vers le serveur Brev :
 
-rsync -avz --exclude="venv" --exclude=".git" --exclude="*.png" --exclude="*.log" -e "ssh" . username@your-brev-instance:~/CNN-JEPA
+rsync -avz --exclude="venv" --exclude=".git" --exclude="*.png" --exclude="*.log" -e "ssh" . olympic-apricot-louse:~/CNN-JEPA
 
 *(Remplacez username@your-brev-instance par vos accès de connexion SSH Brev)*
 
@@ -22,10 +22,10 @@ rsync -avz --exclude="venv" --exclude=".git" --exclude="*.png" --exclude="*.log"
 Pour copier vos identifiants Cloudflare R2 locaux vers le serveur Brev :
 
 1. Créez le dossier de configuration sur le serveur :
-ssh username@your-brev-instance "mkdir -p ~/.config/rclone"
+ssh olympic-apricot-louse "mkdir -p ~/.config/rclone"
 
 2. Copiez le fichier rclone.conf :
-scp ~/.config/rclone/rclone.conf username@your-brev-instance:~/.config/rclone/rclone.conf
+scp ~/.config/rclone/rclone.conf olympic-apricot-louse:~/.config/rclone/rclone.conf
 
 ----------------------------------------------------------------------
 ÉTAPE 3 : SUR LE SERVEUR BREV - INSTALLER LES DÉPENDANCES SYSTÈME
@@ -50,6 +50,8 @@ sudo chown -R $USER /data
 2. Téléchargement des fichiers HDF5 depuis R2 :
 rclone copy r2:sea-vis-data-fan/maritime-train.h5 /data/ --progress
 rclone copy r2:sea-vis-data-fan/maritime-val.h5 /data/ --progress
+rclone copy r2:sea-vis-data-fan/maritime-test.h5 /data/ --progress
+
 
 ----------------------------------------------------------------------
 ÉTAPE 5 : SUR LE SERVEUR BREV - CONFIGURER L'ENVIRONNEMENT PYTHON
@@ -103,3 +105,5 @@ Les fichiers HDF5 sont générés localement sur votre PC personnel en exécutan
    rclone copy /home/dromsis/Pictures/dataset/combined/maritime-val.h5 r2:sea-vis-data-fan/ --progress
 
 Une fois ces opérations effectuées, vos instances Brev utiliseront directement ces fichiers pour l'entraînement.
+
+PYTHONPATH=. /home/dromsis/anaconda3/envs/cnn-jepa/bin/python scripts/viz_app.py

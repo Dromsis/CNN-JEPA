@@ -4,7 +4,8 @@ name: "I-JEPA-YOLO_{data_dataset_name}_{backbone_name}{backbone_scale}_predL{pre
 artifacts_root: "artifacts/pretrain_lightly/ijepacnn_yolo"
 
 mask:
-  strategy: "mixed" # multi-block | random | mixed
+  strategy: "multi-block" # multi-block | random | mixed | variance-biased
+  variance_bias_temp: 2.0
   mutli_block_kwargs:
     aspect_ratio: [0.75, 1.5]
     enc_mask_scale: [1.0, 1.0]
@@ -16,7 +17,7 @@ mask:
 
 # NOTE: "lots of water" dataset. Start with this default and MEASURE first; only tune the
 # mask (lower ratio, or variance-biased sampling) if the pretrained features are weak.
-mask_ratio: 0.6
+mask_ratio: 0.8
 
 backbone:
   name: "yolo26_sea_backbone"
@@ -34,7 +35,7 @@ predictor:
   n_layers: 3
   kernel_size: 3
   dw_sep_conv: True
-use_projection_head: False
+use_projection_head: True
 
 # V-JEPA 2.1 dense/context loss: supervise the visible patches too (weighted by 1/sqrt(dist to
 # the masked region), with a lambda warmup) so features stay spatially structured -> better for
@@ -50,12 +51,18 @@ context_loss:
 deep_supervision:
   enabled: true
 
+variance_loss:
+  enabled: true
+  weight: 1.0
+
+
 data:
   # Unlabeled pretraining on /data/combined/images/train (flat dir, ~121k images, 640px).
   dataset_name: "maritime"
-  num_workers: 12
+  num_workers: 4
   # No labels -> the online linear-probe benchmark is meaningless and slow; keep it off.
   online_benchmark: false
+  subsample: 2
 
 trainer:
   max_epochs: 201
@@ -78,10 +85,9 @@ perf:
 optimizer:
   # A100 80GB @ 640px. Measured: bs 192 -> peak 53 GiB (profile_step.py), so ~27 GiB headroom.
   # lr from the linear scaling rule off the known-good point (bs 64 / lr 0.001): 0.001*192/64.
-  # The collapse watchdog (scripts/watchdog.py) passes lr as an override and halves it on each
-  # relaunch, so this is just the default base.
-  batch_size: 192
-  lr: 0.003
+  batch_size: 128
+  lr: 0.001
+  ema_momentum: 0.999
   weight_decay: 0.01
   cosine_warmpup_sched: True
   lr_warmup_epochs: 10

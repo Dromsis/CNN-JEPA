@@ -45,30 +45,39 @@ def save_imagenet_to_hdf5(dataset_root, output_file, num_workers=4):
 
 # Define custom dataset class to load data from HDF5 file
 class HDF5ImageFolder(Dataset):
-    def __init__(self, root, transform=None):
+    def __init__(self, root, transform=None, subsample=1):
         """A custom PyTorch dataset class for loading images and labels from an HDF5 file.
 
         Args:
         root (str): Path to the HDF5 file containing images and labels.
         transform (callable, optional): A function/transform that takes in an image
             and returns a transformed version. Default: None.
+        subsample (int, optional): Step size to subsample the dataset (e.g. 2 to take 1 out of 2). Default: 1.
         """
         self.transform = transform
         self.hdf5_file = h5py.File(root, 'r', driver='sec2')
 
         self.images = self.hdf5_file['images']
         self.labels = self.hdf5_file['labels']
+        self.subsample = subsample
+
+        # Create a shuffled mapping of indices on initialization
+        num_items = len(self.labels)
+        self.indices = np.arange(num_items)
+        np.random.shuffle(self.indices)
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.labels) // self.subsample
 
     def __getitem__(self, idx):
-        idx = str(idx)
+        # Map idx to our randomly shuffled index list
+        real_idx = self.indices[idx]
+        idx_str = str(real_idx)
         # Why using [()]: https://github.com/h5py/h5py/issues/1779#issuecomment-743447638
         # Why using .copy(): https://github.com/h5py/h5py/issues/2010 
         # Without .copy(), online eval fails with omm error 
-        bytes = self.images[idx][()].copy()
-        label = self.labels[idx][()].copy()
+        bytes = self.images[idx_str][()].copy()
+        label = self.labels[idx_str][()].copy()
         image = Image.open(io.BytesIO(np.array(bytes)))
         image = image.convert('RGB')
         if self.transform:

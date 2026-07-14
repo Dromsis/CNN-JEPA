@@ -63,7 +63,15 @@ class LightlyModel(pl.LightningModule):
         self.projection_head = None
         self.criterion = None
 
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        if self.cfg.get("reset_lr_scheduler", False):
+            if "lr_schedulers" in checkpoint:
+                print("Resetting lr_schedulers from checkpoint to empty list to bypass state restoration.", flush=True)
+                checkpoint["lr_schedulers"] = []
+
+
     def forward(self, x):
+
         """Implment forward step for each method!
 
         Args:
@@ -173,15 +181,30 @@ class LightlyModel(pl.LightningModule):
             )
 
         if self.cfg.optimizer.get('cosine_warmpup_sched', False):
+            if self.cfg.get("reset_lr_scheduler", False):
+                # If we reset the scheduler, calculate remaining epochs and steps to decay properly to 0
+                current_epoch = self.current_epoch
+                max_epochs = self.cfg.trainer.max_epochs
+                batches_per_epoch = int(self.trainer.estimated_stepping_batches / max_epochs)
+                remaining_epochs = max_epochs - current_epoch
+                remaining_steps = max(1, remaining_epochs * batches_per_epoch)
+                
+                warmup_epochs = 0
+                max_steps = remaining_steps
+                print(f"Resumed scheduler: current_epoch={current_epoch}, max_epochs={max_epochs}, batches_per_epoch={batches_per_epoch}, remaining_steps={remaining_steps}. Scheduler will decay from {self.lr} over {remaining_steps} steps without warmup.", flush=True)
+            else:
+                warmup_epochs = int(
+                    self.trainer.estimated_stepping_batches
+                    / self.trainer.max_epochs
+                    * self.cfg.optimizer.get('lr_warmup_epochs', 10)
+                )
+                max_steps = int(self.trainer.estimated_stepping_batches)
+
             scheduler = {
                 "scheduler": CosineWarmupScheduler(
                     optimizer=optim,
-                    warmup_epochs=int(
-                        self.trainer.estimated_stepping_batches
-                        / self.trainer.max_epochs
-                        * self.cfg.optimizer.get('lr_warmup_epochs', 10)
-                    ),
-                    max_epochs=int(self.trainer.estimated_stepping_batches),
+                    warmup_epochs=warmup_epochs,
+                    max_epochs=max_steps,
                 ),
                 "interval": "step",
             }
@@ -194,14 +217,32 @@ class LightlyModel(pl.LightningModule):
             "maritime": HDF5ImageFolder, # flat, label-free dir of images packaged in HDF5 format
         }
         import os
-        maritime_train_path = "/home/dromsis/Pictures/dataset/combined/maritime-train.h5" if os.path.exists("/home/dromsis/Pictures/dataset/combined/maritime-train.h5") else "/data/maritime-train.h5"
-        maritime_val_path = "/home/dromsis/Pictures/dataset/combined/maritime-val.h5" if os.path.exists("/home/dromsis/Pictures/dataset/combined/maritime-val.h5") else "/data/maritime-val.h5"
+        custom_train = self.cfg.data.get("train_hdf5_path", None)
+        custom_val = self.cfg.data.get("val_hdf5_path", None)
+
+        if custom_train and os.path.exists(custom_train):
+            maritime_train_path = custom_train
+        elif os.path.exists("/home/dromsis/Images/dataset/sea-vis-data-fan/combined/maritime-train.h5"):
+            maritime_train_path = "/home/dromsis/Images/dataset/sea-vis-data-fan/combined/maritime-train.h5"
+        elif os.path.exists("/home/dromsis/Pictures/dataset/combined/maritime-train.h5"):
+            maritime_train_path = "/home/dromsis/Pictures/dataset/combined/maritime-train.h5"
+        else:
+            maritime_train_path = "/data/maritime-train.h5"
+
+        if custom_val and os.path.exists(custom_val):
+            maritime_val_path = custom_val
+        elif os.path.exists("/home/dromsis/Images/dataset/sea-vis-data-fan/combined/maritime-val.h5"):
+            maritime_val_path = "/home/dromsis/Images/dataset/sea-vis-data-fan/combined/maritime-val.h5"
+        elif os.path.exists("/home/dromsis/Pictures/dataset/combined/maritime-val.h5"):
+            maritime_val_path = "/home/dromsis/Pictures/dataset/combined/maritime-val.h5"
+        else:
+            maritime_val_path = "/data/maritime-val.h5"
 
         train_dataset_kwargs = {
-            "maritime": dict(root=maritime_train_path),
+            "maritime": dict(root=maritime_train_path, subsample=self.cfg.data.get("subsample", 1)),
         }
         val_dataset_kwargs = {
-            "maritime": dict(root=maritime_val_path),
+            "maritime": dict(root=maritime_val_path, subsample=self.cfg.data.get("subsample", 1)),
         }
         input_sizes = {
             "maritime": 640,
@@ -285,7 +326,8 @@ class LightlyModelMomentum(LightlyModel):
         raise NotImplemented
     
     def training_step(self, batch, batch_idx):
-        momentum = cosine_schedule(self.current_epoch, self.cfg.trainer.max_epochs, 0.996, 1)
+        base_momentum = self.cfg.optimizer.get("ema_momentum", 0.996)
+        momentum = cosine_schedule(self.current_epoch, self.cfg.trainer.max_epochs, base_momentum, 1)
         update_momentum(self.backbone, self.backbone_momentum, m=momentum)
         if self.projection_head_momentum is not None:
             update_momentum(self.projection_head, self.projection_head_momentum, m=momentum)
@@ -327,9 +369,8 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
     version = utils.get_next_version(root_dir)
     ckpt_dir = os.path.join(root_dir, f"version_{version}")
 
-    # Always emit a local CSV of the logged metrics (independent of wandb) so the collapse
-    # watchdog (scripts/watchdog.py) has a robust file to poll for feature_std. Writes to
-    # <ckpt_dir>/csv/metrics.csv.
+    # Always emit a local CSV of the logged metrics (independent of wandb) so we have a robust
+    # file to view feature_std. Writes to <ckpt_dir>/csv/metrics.csv.
     csv_logger = pl.loggers.CSVLogger(save_dir=ckpt_dir, name="csv")
     time.sleep(3) # To allow for other ranks to get the version number right
     if _get_rank() == 0:
@@ -375,7 +416,10 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
         **cfg.trainer,
     )
     print("CSV metrics ->", os.path.join(csv_logger.log_dir, "metrics.csv"), flush=True)
-    trainer.fit(model=model)
+    ckpt_path = cfg.get("ckpt_path", None)
+    if ckpt_path:
+        print(f"Resuming training from checkpoint: {ckpt_path}", flush=True)
+    trainer.fit(model=model, ckpt_path=ckpt_path)
 
 if __name__ == "__main__":
     main_pretrain(LightlyModel)

@@ -1,0 +1,14 @@
+cd /home/dromsis/Documents/CNN-JEPA
+conda activate cnn-jepa
+export YOLO_SEA_REPO=/home/dromsis/Documents/yolo_sea_homemade
+PYTHONPATH=. python pretrain/train_ijepa_yolo.py \
+  +ckpt_path='"/home/dromsis/Documents/CNN-JEPA/artifacts/pretrain_lightly/ijepacnn_yolo_maritime/I-JEPA-YOLO_maritime_yolo26_sea_backbones_predL3K3_Maskmulti-block_lr0.0001_wd0.01_bs32/version_1/last.ckpt"' \
+  data.subsample=4 \
+  optimizer.batch_size=32 \
+  trainer.precision=16-mixed \
+  trainer.devices=1 \
+  trainer.max_epochs=150 \
+  trainer.accumulate_grad_batches=1 \
+  +reset_lr_scheduler=true \
+  optimizer.lr=0.00005
+

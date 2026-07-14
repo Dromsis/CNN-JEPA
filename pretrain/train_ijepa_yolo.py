@@ -77,6 +77,8 @@ class IJEPA_YOLO(LightlyModelMomentum):
             self.predictor_trunk = self._build_predictor(self.backbone.trunk_channels, norm_cls)
 
         self.criterion = F.smooth_l1_loss
+        self.variance_loss_enabled = bool(self.cfg.get("variance_loss", {}).get("enabled", False))
+        self.variance_loss_weight = float(self.cfg.get("variance_loss", {}).get("weight", 1.0))
 
         # Cached (ema_params, src_params) lists for the fused EMA update; built lazily at the
         # first training step (i.e. after Lightning has moved the module to its device).
@@ -143,7 +145,9 @@ class IJEPA_YOLO(LightlyModelMomentum):
             self.fmap_h * (2 ** i) for i in range(int(math.log2(self.downsample_raito)) + 1)
         )
 
-    def mask(self, B: int, device, generator=None):
+    def mask(self, x: torch.Tensor, generator=None):
+        B = x.shape[0]
+        device = x.device
         if self.cfg.mask.strategy == "mixed":
             if torch.rand(1) < self.cfg.mask.mixed_mutli_block_ratio:
                 strategy = "multi-block"
@@ -158,6 +162,25 @@ class IJEPA_YOLO(LightlyModelMomentum):
             context_mask = torch.zeros(B, h * w, dtype=torch.bool, device=device).scatter_(dim=1, index=idx, value=True).view(B, 1, h, w)
             target_mask = context_mask.logical_not()
             return context_mask, target_mask   
+        elif strategy == "variance-biased":
+            h, w = self.fmap_h, self.fmap_w
+            # 1. Convert input x to grayscale
+            gray = 0.2989 * x[:, 0] + 0.5870 * x[:, 1] + 0.1140 * x[:, 2] # (B, H, W)
+            # 2. Unfold to patches of size 32x32
+            patches = gray.unfold(1, self.downsample_raito, self.downsample_raito).unfold(2, self.downsample_raito, self.downsample_raito) # (B, h, w, p, p)
+            patches = patches.contiguous().view(B, h, w, -1)
+            # 3. Compute variance per patch
+            variances = patches.var(dim=-1).view(B, h * w) # (B, h * w)
+            # 4. Compute probabilities with bias temperature
+            bias_temp = self.cfg.mask.get("variance_bias_temp", 2.0)
+            probs = variances ** bias_temp + 1e-4
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+            # 5. Weighted sampling without replacement
+            idx = torch.multinomial(probs, num_samples=self.len_keep, replacement=False) # (B, len_keep)
+            
+            context_mask = torch.zeros(B, h * w, dtype=torch.bool, device=device).scatter_(dim=1, index=idx, value=True).view(B, 1, h, w)
+            target_mask = context_mask.logical_not()
+            return context_mask, target_mask
         elif strategy == "multi-block":
             context_mask, target_mask = self.multi_block_mask(B)
             context_mask = context_mask.unsqueeze(1).to(device, dtype=torch.bool)
@@ -166,7 +189,7 @@ class IJEPA_YOLO(LightlyModelMomentum):
 
     def get_views_to_log_from_batch(self, batch):
         inp_bchw = batch[0]
-        context_mask_b1ff, target_mask_b1ff = self.mask(inp_bchw.shape[0], inp_bchw.device)  # (B, 1, f, f)
+        context_mask_b1ff, target_mask_b1ff = self.mask(inp_bchw)  # (B, 1, f, f)
         context_mask_b1hw = context_mask_b1ff.repeat_interleave(self.downsample_raito, 2).repeat_interleave(self.downsample_raito, 3)  # (B, 1, H, W)
         target_mask_b1hw  =  target_mask_b1ff.repeat_interleave(self.downsample_raito, 2).repeat_interleave(self.downsample_raito, 3)  # (B, 1, H, W)
         context_bchw = inp_bchw * context_mask_b1hw
@@ -213,7 +236,7 @@ class IJEPA_YOLO(LightlyModelMomentum):
         inp_bchw = x
         if self._channels_last:
             inp_bchw = inp_bchw.contiguous(memory_format=torch.channels_last)
-        context_mask_b1ff, target_mask_b1ff = self.mask(inp_bchw.shape[0], inp_bchw.device)
+        context_mask_b1ff, target_mask_b1ff = self.mask(inp_bchw)
         sparse_encoder.set_active(context_mask_b1ff, prefill_sizes=getattr(self, "_prefill_sizes", ()))
         active_b1hw = sparse_encoder._get_active_ex_or_ii(
             H=inp_bchw.shape[2], W=inp_bchw.shape[3], returning_active_ex=True
@@ -275,8 +298,6 @@ class IJEPA_YOLO(LightlyModelMomentum):
         return lam * min(1.0, (self.current_epoch + 1) / warm) if warm > 0 else lam
 
     def _jepa_level_loss(self, p, h, context_mask_b1ff, target_mask_b1ff, ctx_weight=None):
-        p = F.normalize(p, dim=1)
-        h = F.normalize(h, dim=1)
         per_pos = F.smooth_l1_loss(p, h, reduction='none').sum(axis=1, keepdim=True)  # (B,1,f,f)
         tgt = target_mask_b1ff.to(per_pos.dtype)
         loss_pred = per_pos.mul(tgt).sum() / (tgt.sum() + 1e-8)  # masked patches (original JEPA)
@@ -295,6 +316,22 @@ class IJEPA_YOLO(LightlyModelMomentum):
         std = feat.permute(1, 0, 2, 3).reshape(feat.shape[1], -1).std(dim=1).mean()
         self.log(f"{metric_label}/feature_std", std, on_epoch=True)
 
+    def _variance_loss(self, x, eps=1e-4):
+        if x.ndim == 4:
+            # 1. Batch variance (on spatial mean)
+            x_mean = x.mean(dim=(2, 3))  # (B, C)
+            std_batch = torch.sqrt(x_mean.var(dim=0, unbiased=False) + eps)  # (C)
+            loss_batch = torch.sum((std_batch - 1.0) ** 2)
+
+            # 2. Spatial variance (across H, W for each image)
+            std_spatial = torch.sqrt(x.var(dim=(2, 3), unbiased=False) + eps)  # (B, C)
+            loss_spatial = torch.sum((std_spatial - 1.0) ** 2) / x.shape[0]  # mean over batch
+
+            return loss_batch + loss_spatial
+        else:
+            std = torch.sqrt(x.var(dim=0, unbiased=False) + eps)
+            return torch.sum((std - 1.0) ** 2)
+
     def train_val_step(self, batch, batch_idx, metric_label="train_metrics"):
         if self.deep_supervision:
             # Deep Self-Supervision: sum the JEPA loss (masked + context) over all levels.
@@ -312,6 +349,10 @@ class IJEPA_YOLO(LightlyModelMomentum):
                 loss_pred, loss_ctx = self._jepa_level_loss(
                     p_levels[name], h_levels[name], context_mask_b1ff, target_mask_b1ff, ctx_weight=ctx_w)
                 level_loss = loss_pred + (lam * loss_ctx if loss_ctx is not None else 0.0)
+                if self.variance_loss_enabled:
+                    var_loss = self._variance_loss(p_levels[name])
+                    level_loss = level_loss + self.variance_loss_weight * var_loss
+                    self.log(f"{metric_label}/var_loss_{name}", var_loss, on_epoch=True)
                 total = total + level_loss
                 self.log(f"{metric_label}/ijepa_loss_{name}", loss_pred, on_epoch=True)
                 if loss_ctx is not None:
@@ -331,6 +372,10 @@ class IJEPA_YOLO(LightlyModelMomentum):
                 loss = loss_pred + lam * loss_ctx
                 self.log(f"{metric_label}/ctx_loss", loss_ctx, on_epoch=True)
                 self.log(f"{metric_label}/ctx_lambda", lam, on_epoch=True)
+            if self.variance_loss_enabled:
+                var_loss = self._variance_loss(p)
+                loss = loss + self.variance_loss_weight * var_loss
+                self.log(f"{metric_label}/var_loss", var_loss, on_epoch=True)
             self.log(f"{metric_label}/loss", loss, on_epoch=True)
             return loss
 
